@@ -1,4 +1,4 @@
-//! Zem core addon.
+//! Zem base addon.
 //!
 //! One addon process serving every built-in pane and its server-side behavior:
 //! the general status items (time/date/cwd), the terminal PTY backend, the
@@ -22,6 +22,11 @@ use std::sync::Arc;
 
 use zem_addon_sdk::{init, Action, Addon, AddonContext, Event};
 
+/// Canonical manifest id. The host spawns the process with the short key
+/// (`base`) via `ADDON_ID`, but events such as `settings_changed` carry this
+/// canonical id, so both must be recognised (see `terminal::session`).
+pub const ADDON_ID: &str = "sh.zem.base";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ctx = AddonContext::from_env();
@@ -41,10 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stats_state = Arc::new(stats::stats::State::new());
 
     let addon = Addon::new()
-        .id("com.zem.core")
-        .name("core")
+        .id(ADDON_ID)
+        .name("base")
         .version("1.0.0")
-        .description("Zem core panes: terminal, explorer, stats, version control, notes and status items")
+        .description("Zem base panes: terminal, explorer, stats, version control, notes and status items")
         .min_zem_version("0.1.0")
         .author("zem")
         // ── Actions ────────────────────────────────────────────────────────
@@ -171,7 +176,7 @@ mod tests {
     async fn manifest_declares_all_panes() {
         let ctx = AddonContext::from_env();
         let addon = Addon::new()
-            .id("com.zem.core")
+            .id(ADDON_ID)
             .pane(terminal::pane::terminal_pane(
                 terminal::session::SessionManager::new(ctx),
             ))

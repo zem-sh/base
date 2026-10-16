@@ -18,7 +18,7 @@
 //! Detection is headless: it runs as a background tick in
 //! [`crate::terminal::session::SessionManager`] and communicates with the host purely
 //! through pane metadata (`extra.agent`, pane status, notifications) and the
-//! `com.zem.core:agent` collection, which the host auto-assigns via its
+//! `sh.zem.base:agent` collection, which the host auto-assigns via its
 //! `extra.agent` collection rule while `extra.agent` is present.
 
 use std::collections::HashMap;

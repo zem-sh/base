@@ -16,6 +16,7 @@ import { StatusBar } from './components/status-bar'
 import { GithubTab } from './components/github/github-tab'
 import type { DiffInfo } from './types'
 import { versionControlLaunchSchema } from './launch-schema'
+import { ADDON_ID } from '../../constants'
 
 // Self-inject CSS
 // @ts-ignore
@@ -234,7 +235,7 @@ export function VersionControlPane({ paneId, isFocused }: PaneComponentProps) {
     // broadcasts an `addon_action_updated` event. No polling needed.
     const handler = (e: Event) => {
       const payload = (e as CustomEvent).detail
-      if (payload?.addon_id === 'com.zem.core') {
+      if (payload?.addon_id === ADDON_ID) {
         refreshGit()
         // Push/fetch can change PR state; keep GitHub data fresh when connected.
         if (useStore.getState().githubStatus?.configured) {

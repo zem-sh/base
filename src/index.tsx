@@ -1,7 +1,7 @@
 /**
- * Merged Zem core pane extension.
+ * Merged Zem base pane extension.
  *
- * One bundle serves every built-in pane: terminal, explorer, empty (general),
+ * One bundle serves every base pane: terminal, explorer, empty (general),
  * stats, version control and markdown notes. Each pane keeps its own sources
  * under `panes/<name>/` and self-registers its renderer into the host's shared
  * `window.__zemPaneRegistry` bridge when its `register()` runs.

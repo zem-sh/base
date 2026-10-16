@@ -1,8 +1,8 @@
 {
-  "name": "core-zem",
+  "name": "base-zem",
   "version": "1.0.0",
   "private": true,
-  "description": "Zem core addon + pane extension — terminal, explorer, stats, version control, notes and status items",
+  "description": "Zem base addon + pane extension — terminal, explorer, stats, version control, notes and status items",
   "type": "module",
   "scripts": {
     "build": "pnpm build:pane",

@@ -4,6 +4,7 @@ import type {
   RemoteConnectionConfig,
   RemoteFileEntry,
 } from '../types'
+import { ADDON_ID } from '../../../constants'
 
 let _serverUrl = ''
 let _userUuid = ''
@@ -31,7 +32,7 @@ async function addonOperation<T>(
   params: Record<string, unknown>,
   paneId?: number,
 ): Promise<T> {
-  const res = await fetch(`${_serverUrl}/api/addon/com.zem.core/${kind}/${name}`, {
+  const res = await fetch(`${_serverUrl}/api/addon/${ADDON_ID}/${kind}/${name}`, {
     method: 'POST',
     headers: apiHeaders(),
     body: JSON.stringify({

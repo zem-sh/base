@@ -132,6 +132,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "base-addon"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "dirs",
+ "git2",
+ "log",
+ "portable-pty",
+ "reqwest",
+ "russh",
+ "russh-keys",
+ "russh-sftp",
+ "rust-s3",
+ "serde",
+ "serde_json",
+ "starship-battery",
+ "sysinfo 0.35.2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zem-addon-sdk",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -361,33 +388,6 @@ dependencies = [
  "getrandom 0.2.17",
  "once_cell",
  "tiny-keccak",
-]
-
-[[package]]
-name = "core-addon"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "dirs",
- "git2",
- "log",
- "portable-pty",
- "reqwest",
- "russh",
- "russh-keys",
- "russh-sftp",
- "rust-s3",
- "serde",
- "serde_json",
- "starship-battery",
- "sysinfo 0.35.2",
- "tempfile",
- "tokio",
- "tracing",
- "zem-addon-sdk",
 ]
 
 [[package]]

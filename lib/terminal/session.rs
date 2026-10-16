@@ -122,10 +122,9 @@ impl SessionManager {
             .get("addon_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        // The event carries the canonical manifest id (e.g. `com.zem.core`)
-        // while this addon was spawned with the short key (`core`).
-        let is_ours = addon_id == self.ctx.addon_id()
-            || addon_id == format!("com.zem.{}", self.ctx.addon_id());
+        // The event carries the canonical manifest id (`sh.zem.base`) while this
+        // addon was spawned with the short key (`base`); accept either.
+        let is_ours = addon_id == self.ctx.addon_id() || addon_id == crate::ADDON_ID;
         if !is_ours {
             return;
         }

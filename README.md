@@ -1,13 +1,13 @@
-# core-zem
+# base-zem
 
-The zem **core** addon + pane extension. This repo merges what used to live as
+The zem **base** addon + pane extension. This repo merges what used to live as
 six separate addon crates and six separate pane packages in the zem monorepo
 into **one server addon** and **one web pane extension**:
 
 | Piece | Id | What it does | Installed by |
 | --- | --- | --- | --- |
-| `lib/` + `Cargo.toml` — **server addon** | `com.zem.core` | Terminal PTY, filesystem, git, GitHub, system stats, notes, status items and all their queries/mutations/actions | zem (built-in) or `zem addon install` → GitHub release |
-| `src/` + `package.json` — **web extension** | `zem.core` | The pane UIs for terminal, explorer, empty, stats, version control and notes — one bundle, six pane kinds | `POST /api/extension/install` → GitHub release |
+| `lib/` + `Cargo.toml` — **server addon** | `sh.zem.base` | Terminal PTY, filesystem, git, GitHub, system stats, notes, status items and all their queries/mutations/actions | `zem addon install` → GitHub release |
+| `src/` + `package.json` — **web extension** | `sh.zem.base` | The pane UIs for terminal, explorer, empty, stats, version control and notes — one bundle, six pane kinds | `POST /api/extension/install` → GitHub release |
 
 The six pane kinds are `terminal`, `explorer`, `general`, `stats`,
 `version-control` and `notes`; both the addon manifest and the pane manifest
@@ -84,7 +84,7 @@ zem's installers resolve these asset names — do not rename them:
 
 | Asset | Consumed by |
 | --- | --- |
-| `core-macos` / `core-linux` | addon installer (`{name}-{os}`, os = Rust `std::env::consts::OS`) |
+| `base-macos` / `base-linux` | addon installer (`{name}-{os}`, os = Rust `std::env::consts::OS`) |
 | `zem-addon-manifest.toml` | addon installer (exact name required) |
 | `pane-manifest.toml` | extension installer (exact name required) |
 | `index.js` | extension installer (the `pane.entry` from pane-manifest) |
@@ -92,7 +92,7 @@ zem's installers resolve these asset names — do not rename them:
 
 **Upload order matters**: the server infers the addon name from the *first*
 release asset (text before the last `-`), so the platform binaries must be
-uploaded first (`core-macos` → `core`). The release workflow enforces this
+uploaded first (`base-macos` → `base`). The release workflow enforces this
 order.
 
 ### Font assets caveat
@@ -100,7 +100,7 @@ order.
 The terminal pane loads nine font files (~16 MB) referenced as
 `new URL("assets/<name>.ttf", import.meta.url)`; Vite emits them to
 `dist/assets/` and, at runtime, they resolve next to `index.js`
-(`/api/extension/zem.core/assets/<name>.ttf`). The server can already serve
+(`/api/extension/sh.zem.base/assets/<name>.ttf`). The server can already serve
 them, but **zem's extension installer currently downloads only each pane's
 `entry` and optional `style`** — it does not fetch side assets, so a
 GitHub/npm install leaves the fonts missing (and GitHub release asset names
@@ -121,11 +121,12 @@ zem addon install <owner>/base@1.0.0
 Then **restart the zem server** — the addon manager only loads addons from
 `~/.zem/addon/` at startup, so a freshly installed addon appears after a restart.
 
-> The addon id `com.zem.core` sits in the `com.zem.` namespace, which zem treats
-> as a **built-in core addon**: its collections are never pruned as stale and
-> the API refuses to uninstall it (`AddonManager::is_core_addon`). That is the
-> intent for this repo — it *is* zem's core addon. A release-installed copy is
-> therefore not removable through the API.
+> The addon id `sh.zem.base` is **not** in zem's `com.zem.` namespace, so
+> `AddonManager::is_core_addon` returns false: the addon behaves like any other
+> addon — it can be uninstalled through the API and its collections are pruned
+> as stale when it is not loaded. Its collections are therefore only synced when
+> the addon has a registry row (i.e. it is installed, not merely present on
+> disk).
 
 ## Install (web extension)
 
@@ -143,21 +144,21 @@ Verify / manage:
 ```sh
 curl -H "X-User-UUID: <admin-uuid>" http://127.0.0.1:50051/api/extension
 curl -X DELETE -H "X-User-UUID: <admin-uuid>" \
-  http://127.0.0.1:50051/api/extension/zem.core
+  http://127.0.0.1:50051/api/extension/sh.zem.base
 ```
 
-The files land in `~/.zem/extensions/zem.core/` and are served at
-`/api/extension/zem.core/index.js`.
+The files land in `~/.zem/extensions/sh.zem.base/` and are served at
+`/api/extension/sh.zem.base/index.js`.
 
 ## zem host integration
 
-This repo is the extract of zem's built-in core panes, so zem's web client and
+This repo is the extract of zem's built-in panes, so zem's web client and
 addon dispatch need small, deliberate changes to consume it as a *single*
 extension/addon instead of six:
 
 1. **`apps/web/src/lib/builtin-panes.ts`** — `BUILT_IN_PANE_DEFS` currently
    lists six panes with six distinct extension ids (`zem.terminal-pane`, …).
-   Replace them with six entries that all share `id: 'zem.core'` (one entry per
+   Replace them with six entries that all share `id: 'sh.zem.base'` (one entry per
    `kind`), since `paneEntryUrl` builds `<id>/index.js` and one bundle now
    backs every kind.
 2. **`apps/web/src/lib/pane-setup.ts`** — `runPaneQuery` / `runPaneMutation`
@@ -173,10 +174,10 @@ extension/addon instead of six:
 4. **Migrations / seeded rows** — zem seeds collections, rules and status items
    keyed by the old per-addon ids (`com.zem.terminal`, `com.zem.explorer`,
    `com.zem.notes` in `crates/zem/migrations/*.sql` and the terminal `agents`
-   status-bar action). Those keys must move to `com.zem.core` so the merged
-   addon's collections (id becomes `com.zem.core:agent`, …) and status item
+   status-bar action). Those keys must move to `sh.zem.base` so the merged
+   addon's collections (id becomes `sh.zem.base:agent`, …) and status item
    attach to the surviving rows instead of orphaning them.
 
-Until (1) and (3) land, installing `zem.core` puts the manifest and bundle in
+Until (1) and (3) land, installing `sh.zem.base` puts the manifest and bundle in
 place and the catalog/serve endpoints work, but the panes will not appear in the
 web UI and the terminal fonts will 404.

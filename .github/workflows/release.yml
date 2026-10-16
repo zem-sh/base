@@ -1,12 +1,12 @@
 # Builds the server addon (per platform) + the web pane bundle and publishes
 # a GitHub Release whose assets are consumed by zem's installers:
 #
-#   zem addon install <owner>/<repo>          → needs: core-<os>, zem-addon-manifest.toml
+#   zem addon install <owner>/<repo>          → needs: base-<os>, zem-addon-manifest.toml
 #   POST /api/extension/install {"source": …} → needs: pane-manifest.toml, index.js
 #
 # Asset upload ORDER MATTERS: the server infers the addon name from the FIRST
 # release asset (name before the last '-'), so the platform binaries must be
-# uploaded first (core-macos → "core"), before the two manifest files
+# uploaded first (base-macos → "base"), before the two manifest files
 # (zem-addon-manifest.toml → "zem-addon", pane-manifest.toml → "pane").
 #
 # The terminal font files are uploaded too (flattened to base names). zem's
@@ -31,13 +31,13 @@ jobs:
       - name: Build addon
         run: cargo build --release
       - name: Package platform asset
-        run: cp target/release/addon core-macos
+        run: cp target/release/addon base-macos
       - name: Generate addon manifest
-        run: ./core-macos --generate-manifest > zem-addon-manifest.toml
+        run: ./base-macos --generate-manifest > zem-addon-manifest.toml
       - uses: actions/upload-artifact@v4
         with:
-          name: core-macos
-          path: core-macos
+          name: base-macos
+          path: base-macos
       - uses: actions/upload-artifact@v4
         with:
           name: addon-manifest
@@ -52,11 +52,11 @@ jobs:
       - name: Build addon
         run: cargo build --release
       - name: Package platform asset
-        run: cp target/release/addon core-linux
+        run: cp target/release/addon base-linux
       - uses: actions/upload-artifact@v4
         with:
-          name: core-linux
-          path: core-linux
+          name: base-linux
+          path: base-linux
 
   pane:
     runs-on: ubuntu-latest
@@ -102,8 +102,8 @@ jobs:
           ls -la assets/
           # upload-artifact does not preserve the executable bit; zem's
           # installer chmods the binary after download anyway.
-          test -f assets/core-macos
-          test -f assets/core-linux
+          test -f assets/base-macos
+          test -f assets/base-linux
           test -s assets/zem-addon-manifest.toml
           test -s assets/pane-manifest.toml
           test -s assets/index.js
@@ -117,7 +117,7 @@ jobs:
           gh release create "$TAG" --draft --title "$TAG" --generate-notes
           # ORDER MATTERS — platform binaries first (addon name inference),
           # then the addon manifest, then the pane extension files.
-          for f in core-macos core-linux zem-addon-manifest.toml pane-manifest.toml index.js; do
+          for f in base-macos base-linux zem-addon-manifest.toml pane-manifest.toml index.js; do
             gh release upload "$TAG" "assets/$f"
           done
           # Fonts last (flat assets; see the header note).

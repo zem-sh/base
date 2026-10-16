@@ -1,7 +1,7 @@
-id          = "zem.core"
-name        = "core"
+id          = "sh.zem.base"
+name        = "base"
 version     = "1.0.0"
-description = "Zem core pane bundle: terminal, explorer, empty, stats, version control and notes"
+description = "Zem base pane bundle: terminal, explorer, empty, stats, version control and notes"
 author      = "zem"
 
 [[pane]]

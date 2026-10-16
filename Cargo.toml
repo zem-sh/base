@@ -1,8 +1,8 @@
 [package]
-name = "core-addon"
+name = "base-addon"
 version = "1.0.0"
 edition = "2021"
-description = "Zem core addon: terminal, explorer, stats, version control, notes and general status items"
+description = "Zem base addon: terminal, explorer, stats, version control, notes and general status items"
 license = "MIT"
 
 [[bin]]
