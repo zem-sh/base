@@ -77,3 +77,10 @@ export function setWorkspaceId(workspaceId: number | null): void {
 export function setConfigHelpers(update: ConfigHelpersUpdate, get: ConfigHelpersGet): void {
   for (const pane of panes) pane.setConfigHelpers?.(update, get)
 }
+
+/**
+ * The terminal's settings store, re-exported so the host can push the active
+ * app theme into a terminal pane that loads later (see `setTerminalActiveTheme`
+ * in the host's pane-runtime).
+ */
+export { useTerminalSettings } from './panes/terminal'
