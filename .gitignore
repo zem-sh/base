@@ -1,0 +1,15 @@
+# Rust
+target/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+cargo-addon-manifest.toml
+
+# Generated release addon manifest
+zem-addon-manifest.toml
+
+# Misc
+.DS_Store
+*.log

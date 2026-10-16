@@ -1,0 +1,32 @@
+{
+  "//": "Shared runtime contract. The host app (dev: Vite optimized deps, prod: /vendor import map) provides these packages to every pane extension; panes externalize them and bundle everything else. Keep in sync with pane vite configs, apps/web/vite.config.ts, scripts/build-vendor.mjs and apps/web/index.html.",
+  "packages": [
+    "react",
+    "react-dom",
+    "react-dom/client",
+    "react/jsx-runtime",
+    "@zem-sh/pane",
+    "zustand",
+    "lucide-react",
+    "motion",
+    "clsx",
+    "tailwind-merge",
+    "class-variance-authority",
+    "@base-ui/react",
+    "@codemirror/commands",
+    "@codemirror/language",
+    "@codemirror/language-data",
+    "@codemirror/lang-markdown",
+    "@codemirror/merge",
+    "@codemirror/state",
+    "@codemirror/view",
+    "@lezer/highlight",
+    "@replit/codemirror-vim"
+  ],
+  "subpaths": [
+    "motion/react",
+    "@base-ui/react/menu",
+    "@base-ui/react/button",
+    "@base-ui/react/popover"
+  ]
+}

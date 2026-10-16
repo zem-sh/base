@@ -1,0 +1,51 @@
+[package]
+name = "core-addon"
+version = "1.0.0"
+edition = "2021"
+description = "Zem core addon: terminal, explorer, stats, version control, notes and general status items"
+license = "MIT"
+
+[[bin]]
+name = "addon"
+path = "lib/main.rs"
+
+[dependencies]
+zem-addon-sdk = "0.1.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# general
+# (chrono above)
+
+# stats
+sysinfo = "0.35"
+starship-battery = "0.11"
+
+# terminal
+portable-pty = "0.8"
+
+# version control
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+anyhow = "1"
+base64 = "0.22"
+tempfile = "3"
+log = "0.4"
+
+# explorer
+dirs = "6"
+rust-s3 = { version = "0.37.2", features = ["tokio"] }
+russh = "0.46"
+russh-keys = "0.46"
+russh-sftp = "2.3"
+async-trait = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "s"

@@ -1,0 +1,47 @@
+id          = "zem.core"
+name        = "core"
+version     = "1.0.0"
+description = "Zem core pane bundle: terminal, explorer, empty, stats, version control and notes"
+author      = "zem"
+
+[[pane]]
+kind        = "terminal"
+title       = "Terminal"
+icon        = "nerd:terminal"
+description = "Full terminal emulator on the Ghostty core — ligatures, images, themes and GPU rendering"
+entry       = "./index.js"
+
+[[pane]]
+kind        = "explorer"
+title       = "Explorer"
+icon        = "nerd:folder"
+description = "Browse files and folders with an inline code and image viewer"
+entry       = "./index.js"
+
+[[pane]]
+kind        = "general"
+title       = "Empty"
+icon        = "nerd:square"
+description = "Empty placeholder pane"
+entry       = "./index.js"
+
+[[pane]]
+kind        = "stats"
+title       = "Stats"
+icon        = "nerd:chart-line"
+description = "Live system resource stats"
+entry       = "./index.js"
+
+[[pane]]
+kind        = "version-control"
+title       = "Version Control"
+icon        = "nerd:git-branch"
+description = "Git changes, diffs, conflicts and pull requests"
+entry       = "./index.js"
+
+[[pane]]
+kind        = "notes"
+title       = "Notes"
+icon        = "nerd:note"
+description = "Markdown notes with callouts and code blocks"
+entry       = "./index.js"
