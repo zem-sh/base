@@ -9,7 +9,8 @@
     "build:pane": "vite build && node scripts/assert-host-covered.mjs",
     "build:addon": "cargo build --release",
     "generate:addon-manifest": "cargo run --release -- --generate-manifest",
-    "dev": "vite build --watch"
+    "dev": "node scripts/dev.mjs",
+    "dev:pane": "node scripts/dev.mjs --pane-only"
   },
   "dependencies": {
     "@react-symbols/icons": "^1.3.1",

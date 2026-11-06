@@ -175,10 +175,32 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
   const activeShaders = useTerminalSettings(s => s.activeShaders)
   const lineHeight = useTerminalSettings(s => s.lineHeight)
 
+  // The terminal core routes single printable keys through a hidden IME
+  // textarea: it skips them in its window keydown handler and expects the
+  // textarea to insert them (then reads them back from `beforeinput`/`input`).
+  // That textarea is created `readOnly` and only its own "make it editable"
+  // path clears the flag — but that path bails out as soon as the textarea is
+  // already the active element, so a textarea that holds focus stays read-only
+  // and swallows every plain keystroke. WebKit (the Tauri shell) keeps the
+  // textarea focused where Chromium leaves the canvas focused, which is why the
+  // browser build types fine and the Tauri build does not. Keys that bypass the
+  // insertion path — auto-repeat, Ctrl chords, Backspace — keep working, which
+  // is the signature of this bug. Re-arm the input whenever this pane takes
+  // typing focus.
+  const armTypingInput = useCallback(() => {
+    try {
+      const input = terminalRef.current?.imeInput
+      if (input?.readOnly) input.readOnly = false
+    } catch { /* terminal surface not mounted yet */ }
+  }, [])
+
   const { rootRef } = usePane(
     paneId,
     isFocused,
-    () => terminalRef.current?.focus(),
+    () => {
+      terminalRef.current?.focus()
+      armTypingInput()
+    },
     (action) => {
       const app = terminalRef.current
       if (!app) return
@@ -332,7 +354,10 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
       // init can complete long after the user moved focus elsewhere (or the
       // pane simply started unfocused), and guessing wrong would steal keys
       // from whichever pane actually has focus.
-      if (focusedRef.current) r.focus()
+      if (focusedRef.current) {
+        r.focus()
+        armTypingInput()
+      }
     })()
 
     return () => {
@@ -492,7 +517,7 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
 
   return (
     <div className="relative w-full h-full">
-      <div ref={rootRef} className="w-full h-full" />
+      <div ref={rootRef} className="w-full h-full" onPointerDown={armTypingInput} />
       {vimActive && (
         <div
           className="pointer-events-none absolute bottom-0 right-0 z-10 px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground"

@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod process;
+pub mod region;
 pub mod screen;
 
 const MAX_TAIL_BYTES: usize = 32 * 1024;
@@ -396,7 +397,9 @@ impl AgentProfile {
             display,
             aliases,
             path_fragments,
-            working_markers: Vec::new(),
+            // Shared turn chrome ("esc to interrupt" and friends). TUI
+            // profiles replace this with their own screen markers below.
+            working_markers: DEFAULT_WORKING_MARKERS.clone(),
             braille_working: false,
             default_status: AgentStatus::Working,
         }
@@ -762,40 +765,76 @@ impl AgentRegistry {
 static DEFAULT_PROMPT_MARKERS: LazyLock<Vec<String>> =
     LazyLock::new(|| ["❯", "▌"].iter().map(|s| s.to_string()).collect());
 
+/// Unambiguous blocker banners: a live line whose mere presence means the
+/// agent is parked on a decision.
+///
+/// This list is deliberately tiny. Broad substrings like `press enter`,
+/// `enter confirm`, `continue?` or `yes, and` appear in ordinary output and
+/// in agents' permanent keybinding footers, so matching them anywhere on the
+/// screen pinned panes to `blocked` forever. Everything less specific goes
+/// through the gated [`live_dialog`] check instead, which is how herdr's
+/// manifests express approvals (`all`/`any` gates over live regions).
 static DEFAULT_BLOCKED_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
     [
-        "press enter",
-        "press return",
-        "press <enter>",
-        "use arrow keys",
-        "(use arrow keys)",
-        "waiting for your response",
-        "waiting for your input",
-        "waiting for response",
-        "waiting for input",
-        "yes, and",
-        "no, and",
-        "allow tool",
-        "allow access",
-        "allow this",
-        "do you want to proceed",
-        "do you want to continue",
-        "would you like to",
-        "continue?",
-        "select an option",
-        "choose an option",
-        "y/n",
-        "(y/n)",
-        "yes/no",
-        "? select",
-        // OpenCode's permission dialog (herdr's `permission_required` rule):
-        // the dialog banner and its key-hint rows only appear while a tool
-        // request awaits approval.
+        // OpenCode's permission dialog banner (herdr's `permission_required`).
         "△ permission required",
-        "esc dismiss",
-        "enter confirm",
-        "enter submit",
-        "enter toggle",
+        "press enter to confirm or esc to cancel",
+        "waiting for permission",
+        "do you trust the contents of this directory",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+});
+
+/// Footer affordances: only a live dialog (or dialog-like prompt) draws these.
+/// On their own they are not a blocker — they are half of the gate.
+static BLOCKED_CONTROLS: &[&str] = &[
+    "esc to cancel",
+    "esc dismiss",
+    "enter to confirm",
+    "press enter to confirm",
+    "enter to select",
+    "enter to submit",
+    "enter toggle",
+    "tab to amend",
+    "arrow keys to navigate",
+    "tab/arrow keys",
+    "↑/↓ to navigate",
+    "↑↓ to navigate",
+    "use arrow keys",
+];
+
+/// The decision text itself — the other half of the gate.
+static BLOCKED_QUESTIONS: &[&str] = &[
+    "do you want to proceed",
+    "do you want to continue",
+    "do you want to allow",
+    "would you like to",
+    "allow tool",
+    "allow access",
+    "allow command?",
+    "select an option",
+    "choose an option",
+    "review your answers",
+    "run a dynamic workflow",
+    "waiting for your input",
+    "waiting for your response",
+    "permission required",
+];
+
+/// Bare yes/no prompts (herdr's weak `[y/n]` blocker).
+static BLOCKED_YES_NO: &[&str] = &["[y/n]", "(y/n)", "yes (y)"];
+
+/// Shared "agent is working right now" chrome. Agents draw their interrupt
+/// hint only for the duration of a turn; at the prompt it is gone.
+static DEFAULT_WORKING_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    [
+        "esc to interrupt",
+        "press esc to interrupt",
+        "esc again to interrupt",
+        "ctrl+c to interrupt",
+        " to interrupt)",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -865,39 +904,39 @@ static DEFAULT_FATAL_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Default status decision (highest priority first). Signals come from three
-/// sources — the linear tail (`ctx.tail`, line-based agents), the current
-/// screen (`ctx.screen`, TUI agents), and the terminal title (`ctx.title`,
-/// title-driven agents):
-///   1. error markers in the tail's last non-empty lines or anywhere on the
-///      current screen → error — checked before the working signals so a
-///      fresh prompt (`❯`) after a failure can't mask it;
-///   2. fatal / startup blockers ("Not logged in", "Please run /login", ...)
-///      in the recent tail or on the screen → error (persistent banners);
-///   3. a *fresh* working spinner in the terminal title → running — the most
+/// Status decision over live terminal chrome, highest priority first.
+///
+/// Every signal is read through a [`region`] of the *current* screen (or of
+/// the linear tail before the screen model has seen bytes), never by scanning
+/// the whole buffer — that is the central rule herdr's detection manifests
+/// encode (`region` + `priority` + `all`/`any`/`not` gates). Scrollback text
+/// the agent already moved past must never decide the pane's status.
+///   1. a *current* error row on the screen, or an error line in the two
+///      non-empty lines right above the input box → error;
+///   2. fatal / startup banners ("Not logged in", "Please run /login", ...)
+///      in the live bottom region → error — they persist until the agent
+///      can actually run;
+///   3. a blocked title (Codex's "Action Required") → blocked;
+///   4. a *fresh* working spinner in the terminal title → working — the most
 ///      reliable "working right now" signal for title-driven agents;
-///   4. waiting markers (permission questions, y/n prompts, select menus,
-///      OpenCode's permission dialog) in the tail's last lines or on the
-///      current screen → blocked — the agent is waiting on the user to
-///      answer, distinct from a plain idle prompt;
-///   5. the agent's working markers on the current screen (Pi's "Working..."
-///      and its braille spinner `⠧`, OpenCode's "esc to interrupt",
-///      progress bars) → working — TUI agents repaint these only while
-///      working;
-///   6. at the input prompt — `❯` as the tail's last line or a `❯` line on
-///      the current screen → idle when the screen is static or a title is
-///      present (typing echo must not flip the status);
-///   7. an idle title marker (`✳` prefix, "Action Required") → idle;
-///   8. a static screen (unchanged for the quiet window) → idle — TUI agents
-///      stop redrawing when they're done, so a repaint-free screen means
-///      waiting;
-///   9. otherwise → the per-agent default (`Working` for streaming agents,
+///   5. an unambiguous blocker banner in the live bottom region (per-agent
+///      settings replace this list) → blocked;
+///   6. a gated dialog there — question (or bare y/n) plus choices or a
+///      footer affordance, with nothing but dialog chrome below it → blocked;
+///   7. the agent's working markers (interrupt hints, "Working...",
+///      progress bars) or, for Pi, a braille spinner in the live bottom
+///      region → working;
+///   8. the prompt glyph in the input-box body (or as the last output line on
+///      a line-oriented screen) → idle, unless no title exists and output is
+///      actively streaming;
+///   9. a static, non-spinner title → idle;
+///  10. a screen unchanged for the quiet window → idle;
+///  11. the arming grace → idle (a freshly launched agent is booting);
+///  12. otherwise → the per-agent default (`Working` for streaming agents,
 ///      `Idle` for full-screen TUI agents).
 ///
-/// Generic error markers are constrained to the last lines so mid-build
-/// "error:" noise from a failing compile inside the agent's output doesn't
-/// flip state. Agent *exit* failures are detected via the detector's own
-/// last_exit signal once the process is gone.
+/// Agent *exit* failures are detected via the detector's own last_exit signal
+/// once the process is gone.
 fn status_from_markers(
     prompt_markers: &[String],
     blocked_markers: &[String],
@@ -907,39 +946,48 @@ fn status_from_markers(
     default_status: AgentStatus,
     ctx: &StatusContext,
 ) -> AgentStatus {
-    let recent = recent_lines(ctx.tail, 14);
-    let last_line = recent
-        .iter()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| *line)
-        .unwrap_or("");
-    let last = recent
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .take(2)
-        .map(|line| *line)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let last_lower = last.to_lowercase();
-    let recent_text = recent.join("\n");
-    let recent_lower = recent_text.to_lowercase();
-    let screen = ctx.screen;
-    let screen_lower = screen.to_lowercase();
+    // The live view: the reconstructed visible screen is authoritative. The
+    // linear tail is only a fallback for the window before the screen model
+    // has seen bytes (reconnect replay, unit tests). Matching the tail stream
+    // is what let redraw fragments and long-finished output drive the status.
+    let view = if ctx.screen.trim().is_empty() {
+        ctx.tail
+    } else {
+        ctx.screen
+    };
+    // Live regions, in herdr's sense. Nothing below matches the whole screen.
+    let bottom = region::bottom_non_empty_lines(view, 12).to_lowercase();
+    let above_tail = last_non_empty_lines(region::above_prompt_box(view), 2);
+    let box_body = region::prompt_box_body(view).unwrap_or("");
+    let is_tui = default_status == AgentStatus::Idle;
+    // The prompt glyph is only live chrome inside the input box. Without a
+    // box: a TUI keeps its input row near the bottom (bottom 3 lines), while
+    // a line-oriented agent's prompt *is* the last output line — a submitted
+    // prompt that scrolled up must not read as waiting.
+    let prompt_area = if !box_body.trim().is_empty() {
+        box_body
+    } else if is_tui {
+        region::bottom_non_empty_lines(view, 3)
+    } else {
+        region::last_non_empty_line(view)
+    };
 
-    // 1. Error markers — tail's last lines (a fresh prompt reappears right
-    //    after a failure, so the error must win) or a *current* error row on
-    //    the screen (TUI agents paint persistent error status text, but only
-    //    while the row is freshly painted — stale scrollback error lines must
-    //    not pin the status after the agent recovers).
-    if contains_any(&last_lower, error_markers) || ctx.screen_error_fresh {
+    // 1. Errors — live chrome only. An error line sitting right above the
+    //    input box is the current turn's failure; an error the agent has
+    //    scrolled past is history. Generic error words are never matched
+    //    across the wider buffer (a failed tool call is normal agent work).
+    if ctx.screen_error_fresh || contains_any(&above_tail, error_markers) {
         return AgentStatus::Error;
     }
-    // 2. Fatal / startup blockers — persistent banners (e.g. "Not logged in ·
-    //    Please run /login") that sit on screen above the prompt.
-    if contains_any(&recent_lower, &DEFAULT_FATAL_MARKERS)
-        || (!screen.is_empty() && contains_any(&screen_lower, &DEFAULT_FATAL_MARKERS))
-    {
+    //    Fatal / startup banners ("Not logged in · Please run /login") stay in
+    //    the live bottom region until the agent can run.
+    if contains_any(&bottom, &DEFAULT_FATAL_MARKERS) {
         return AgentStatus::Error;
+    }
+    // 2. A blocked title outranks every screen rule: Codex writes
+    //    "Action Required" while it waits for approval.
+    if title_is_blocked(ctx.title) {
+        return AgentStatus::Blocked;
     }
     // 3. A *fresh* working spinner in the terminal title. Stale spinners
     //    (agent finished but the idle-title update was missed) fall through
@@ -947,87 +995,70 @@ fn status_from_markers(
     if ctx.title_fresh && title_has_braille_spinner(ctx.title) {
         return AgentStatus::Working;
     }
-    // 4. Waiting markers — permission questions, y/n prompts, select menus
-    //    (tail or screen) → blocked. Only the tail's *last* non-empty lines
-    //    count: a permission prompt always sits at the bottom of the output,
-    //    and an answered prompt scrolls away once work resumes (a stale line
-    //    in the wider scrollback must not pin the pane to blocked). Eight
-    //    lines comfortably covers even long permission menus (option rows
-    //    like "yes, and…" are themselves markers). The current screen is
-    //    authoritative for TUI dialogs, which repaint it away the moment
-    //    they are answered.
-    //
-    //    Note: a *fresh* title spinner (step 3) still outranks this — the
-    //    agent is mid-animation, mirroring herdr's working > permission
-    //    priority; the spinner title stops refreshing the moment the agent
-    //    parks on a question.
-    let blocked_recent = recent
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .take(8)
-        .map(|line| *line)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
-    if contains_any(&blocked_recent, blocked_markers)
-        || (!screen.is_empty() && contains_any(&screen_lower, blocked_markers))
-    {
+    // 4. Unambiguous blocker banners in the live bottom region (a permission
+    //    dialog, an elicitation banner). Per-agent settings replace this list.
+    if contains_any(&bottom, blocked_markers) {
         return AgentStatus::Blocked;
     }
-    // 5. The agent's working markers on the current screen — plus, for Pi,
+    // 5. Gated dialogs — herdr's `all`/`any` shape over live regions. A
+    //    control hint alone (`esc to cancel`, `enter confirm`) is not a
+    //    blocker: agents print those in their permanent keybinding footer.
+    //    It counts only as the footer/hint of a question with choices, and
+    //    the scan stops at the first ordinary output line going up — so an
+    //    answered dialog scrolls out of the live region instead of pinning
+    //    the pane to `blocked` forever.
+    let working_region = region::bottom_non_empty_lines(view, 12);
+    if live_dialog(working_region) {
+        return AgentStatus::Blocked;
+    }
+    // 6. The agent's working markers in the live bottom region — plus, for Pi,
     //    its braille spinner: the spinner char (U+2800–U+28FF) keeps
-    //    repainting for the whole thinking phase even while the adjacent
-    //    text changes ("Working...", "Reading files...", ...), so it is the
-    //    most reliable "working right now" screen signal. TUI agents
-    //    repaint these only while working, so their presence means Working.
+    //    repainting for the whole thinking phase even while the adjacent text
+    //    changes ("Working...", "Reading files...", ...). The region limit
+    //    matters: spinner glyphs the agent printed into its transcript must
+    //    not keep the pane `working` after the turn ended.
     //
     //    Unlike the error markers (step 1), these are deliberately *not*
     //    recency-gated: TUI agents erase the spinner/hint rows when they
     //    finish (the idle frame repaints them), so a lingering "Working..."
-    //    or braille char can't pin the status — while a long quiet tool run
-    //    (e.g. a build that repaints nothing for seconds) must keep Working.
+    //    can't pin the status — while a long quiet tool run (e.g. a build
+    //    that repaints nothing for seconds) must keep Working.
     let screen_working = (!working_markers.is_empty()
-        && contains_any(&screen_lower, working_markers))
-        || (braille_working && screen.chars().any(|c| matches!(c as u32, 0x2800..=0x28FF)));
+        && contains_any(&working_region.to_lowercase(), working_markers))
+        || (braille_working && has_braille(working_region));
     if screen_working {
         return AgentStatus::Working;
     }
-    // 6. At the input prompt. Line-based agents (Claude): `❯` as the tail's
-    //    last line. TUI agents (default Idle): a `❯` line anywhere on the
-    //    current screen — their input box sits at a fixed row, and the screen
-    //    is stateful (working markers on screen already returned Working in
-    //    step 5), so the prompt on screen means waiting. A static screen or
-    //    any non-empty title means idle; typing echo must not flip the
-    //    status. Only with *no* title and output actively streaming do we
-    //    guess "working" (an agent drawing without a title signal).
-    let is_tui = default_status == AgentStatus::Idle;
-    let last_trimmed = last_line.trim();
-    let at_prompt_tail = last_trimmed.starts_with('❯')
-        || prompt_markers
-            .iter()
-            .any(|m| last_trimmed.eq_ignore_ascii_case(m));
-    let at_prompt_screen = is_tui
-        && screen.lines().any(|l| {
-            let t = l.trim();
-            t.starts_with('❯') || prompt_markers.iter().any(|m| t.eq_ignore_ascii_case(m))
-        });
-    if at_prompt_tail || at_prompt_screen {
+    // 7. At the input prompt. The prompt glyph belongs to the box body
+    //    (herdr's `prompt_box_body` region) or, on a line-oriented screen, to
+    //    the last output line — never to a `❯` the agent echoed mid-screen.
+    //    Working chrome was already consumed above, so a visible prompt here
+    //    means the agent is waiting. A static screen or any non-empty title
+    //    still means idle so typing echo cannot flip the status; only with no
+    //    title at all and output actively streaming do we guess "working".
+    let at_prompt = prompt_line(prompt_area, prompt_markers)
+        || prompt_line(region::last_non_empty_line(view), prompt_markers);
+    if at_prompt {
         if is_tui || ctx.quiet || ctx.screen_quiet || !ctx.title.is_empty() || ctx.armed_grace {
             return AgentStatus::Idle;
         }
         return AgentStatus::Working;
     }
-    // 7. Idle title marker (static ✳ / "Action Required").
+    // 8. A static title. `✳` is Claude's explicit idle prefix; herdr's Codex
+    //    manifest keys the same state off any title that carries neither the
+    //    working spinner nor the blocked banner. Without the general rule, a
+    //    known agent whose title does not animate while idle fell through to
+    //    the streaming default and reported `working` forever.
     if title_is_idle(ctx.title) {
         return AgentStatus::Idle;
     }
-    // 8. A static screen — TUI agents stop redrawing when they're done; the
+    // 9. A static screen — TUI agents stop redrawing when they're done; the
     //    reconstructed screen content (not cursor blinks) has been unchanged
     //    for the quiet window, so the agent is waiting.
     if ctx.screen_quiet {
         return AgentStatus::Idle;
     }
-    // 9. Per-agent default. A freshly armed agent is booting to its prompt —
+    // 10. Per-agent default. A freshly armed agent is booting to its prompt —
     //    no signal yet must read Idle, not the (Working) default, so opening
     //    an agent never flashes "working". Real work/error signals already
     //    returned above and win during the grace.
@@ -1040,18 +1071,113 @@ fn status_from_markers(
 /// Claude/Codex write a braille spinner (U+2800–U+28FF) into the terminal
 /// title while the agent is working.
 fn title_has_braille_spinner(title: &str) -> bool {
-    title.chars().any(|c| matches!(c as u32, 0x2800..=0x28FF))
+    has_braille(title)
 }
 
-/// Static terminal-title markers that mean the agent is *not* working:
-/// Claude's `✳` (U+2733) prefix and Codex's "Action Required" banner.
+/// Codex's approval banner in the title (herdr's `osc_title_blocked`).
+fn title_is_blocked(title: &str) -> bool {
+    title.contains("Action Required")
+}
+
+/// Static titles that mean the agent is *not* working: Claude's `✳` (U+2733)
+/// prefix, or any title with neither the working spinner nor the blocked
+/// banner (herdr's `osc_title_idle`).
 fn title_is_idle(title: &str) -> bool {
-    let trimmed = title.trim_start();
-    trimmed.starts_with('✳') || trimmed.contains("Action Required")
+    let trimmed = title.trim();
+    !trimmed.is_empty() && !title_is_blocked(trimmed) && !title_has_braille_spinner(trimmed)
 }
 
 fn contains_any(text: &str, markers: &[String]) -> bool {
     markers.iter().any(|m| text.contains(m.as_str()))
+}
+
+fn contains_any_str(text: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|m| text.contains(m))
+}
+
+/// The last `count` non-empty lines of `text`, lowercased and joined.
+fn last_non_empty_lines(text: &str, count: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(count);
+    lines[start..].join("\n").to_lowercase()
+}
+
+fn has_braille(text: &str) -> bool {
+    text.chars().any(|c| matches!(c as u32, 0x2800..=0x28FF))
+}
+
+/// Whether any line starts with a prompt glyph.
+fn prompt_line(text: &str, markers: &[String]) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        markers
+            .iter()
+            .any(|m| trimmed.starts_with(m.as_str()) || trimmed.eq_ignore_ascii_case(m))
+    })
+}
+
+/// Box-drawing rows that carry no meaning of their own (borders, separators).
+fn is_chrome_line(line: &str) -> bool {
+    line.chars().all(|c| {
+        matches!(
+            c,
+            '─' | '│' | '┃' | '╭' | '╮' | '╰' | '╯' | '┏' | '┓' | '┗' | '┛' | '|' | '+' | ' ' | '\t'
+        )
+    })
+}
+
+/// A row of a choice menu: `❯ 1. Yes`, `2. No`, `Allow`, `Deny`, `Accept`.
+fn is_choice_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let stripped = trimmed
+        .trim_start_matches(['❯', '›', '>', '*', '•', '◦'])
+        .trim_start();
+    let lower = stripped.to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let numbered = lower.len() > 2
+        && lower.as_bytes()[0].is_ascii_digit()
+        && matches!(lower.as_bytes()[1], b'.' | b')' | b':');
+    numbered
+        || ["yes", "no", "allow", "deny", "accept", "decline"]
+            .iter()
+            .any(|word| lower.starts_with(word))
+}
+
+/// Whether the live bottom of the buffer is a dialog awaiting an answer.
+///
+/// Mirrors herdr's `all`/`any` gates: a dialog needs the question (or a bare
+/// y/n) plus a choice row or a footer affordance, and every line above it in
+/// the region must still be dialog chrome. Ordinary output breaks that chain,
+/// which is what keeps answered prompts from pinning the pane to `blocked`.
+fn live_dialog(text: &str) -> bool {
+    let mut has_control = false;
+    let mut has_choice = false;
+    let mut has_question = false;
+    let mut has_yes_no = false;
+
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || is_chrome_line(trimmed) {
+            continue;
+        }
+        let lower = trimmed.to_lowercase();
+        let control = contains_any_str(&lower, BLOCKED_CONTROLS);
+        let choice = is_choice_line(trimmed);
+        let question = contains_any_str(&lower, BLOCKED_QUESTIONS);
+        let yes_no = contains_any_str(&lower, BLOCKED_YES_NO);
+        if !(control || choice || question || yes_no) {
+            break;
+        }
+        has_control |= control;
+        has_choice |= choice;
+        has_question |= question;
+        has_yes_no |= yes_no;
+    }
+
+    ((has_question || has_yes_no) && (has_choice || has_control || has_yes_no))
+        || (has_control && has_choice)
 }
 
 /// Most recent `n` lines, most-recent first, empty lines kept.
@@ -1092,20 +1218,24 @@ fn idle_message(tail: &str, screen: &str) -> Option<String> {
 /// this only runs when the status is already Blocked (the marker is current
 /// on the screen or in the detection window).
 fn blocked_message(tail: &str, screen: &str, markers: &[String]) -> Option<String> {
-    for line in screen.lines().chain(recent_lines(tail, 14)) {
+    // Describe live chrome only — the live bottom region, not the scrollback.
+    let view = if screen.trim().is_empty() { tail } else { screen };
+    let live = region::bottom_non_empty_lines(view, 12);
+    for line in live.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if contains_any(&trimmed.to_lowercase(), markers) {
+        let lower = trimmed.to_lowercase();
+        if contains_any(&lower, markers)
+            || contains_any_str(&lower, BLOCKED_QUESTIONS)
+            || contains_any_str(&lower, BLOCKED_YES_NO)
+            || is_choice_line(trimmed)
+        {
             return Some(truncate_message(trimmed));
         }
     }
-    tail_message(if screen.trim().is_empty() {
-        tail
-    } else {
-        screen
-    })
+    tail_message(live)
 }
 
 /// Message for the error state: the most recent line carrying an error
@@ -1114,22 +1244,20 @@ fn blocked_message(tail: &str, screen: &str, markers: &[String]) -> Option<Strin
 /// last visible lines. Scans the current screen first (TUI agents paint
 /// persistent error status text there), then the tail.
 fn error_message(tail: &str, screen: &str, markers: &[String]) -> Option<String> {
-    for line in screen.lines().chain(recent_lines(tail, 14)) {
+    // Describe live chrome only — the live bottom region, not the scrollback.
+    let view = if screen.trim().is_empty() { tail } else { screen };
+    let live = region::bottom_non_empty_lines(view, 12);
+    for line in live.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if contains_any(&trimmed.to_lowercase(), markers)
-            || contains_any(&trimmed.to_lowercase(), &DEFAULT_FATAL_MARKERS)
-        {
+        let lower = trimmed.to_lowercase();
+        if contains_any(&lower, markers) || contains_any(&lower, &DEFAULT_FATAL_MARKERS) {
             return Some(truncate_message(trimmed));
         }
     }
-    tail_message(if screen.trim().is_empty() {
-        tail
-    } else {
-        screen
-    })
+    tail_message(live)
 }
 
 fn truncate_message(text: &str) -> String {
@@ -2395,6 +2523,111 @@ mod tests {
         );
         assert_eq!(json["kind"], "claude");
         assert_eq!(json["message"], "waiting");
+    }
+
+    // ---------------------------------------------------------------------
+    // Live-region rules (ported from herdr's detection manifests)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn live_permission_dialog_with_footer_is_blocked() {
+        let mech = profile(AgentKind::Claude);
+        let screen = "previous output\n──────\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n esc to cancel\n──────";
+        assert_eq!(
+            mech.detect_status(&ctx_screen("", screen, true, true)),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn answered_dialog_above_a_live_footer_is_not_blocked() {
+        // The dialog was answered and normal output rendered below it: the
+        // question is scrollback, not live chrome. The old whole-screen
+        // marker scan pinned this pane to `blocked` forever.
+        let mech = profile(AgentKind::Claude);
+        let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. No\nDone.\n──────\n  ? for shortcuts";
+        assert_eq!(
+            mech.detect_status(&ctx_screen("", screen, true, true)),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn control_footer_without_a_question_is_not_blocked() {
+        // Agents print `esc to cancel` / `enter confirm` in permanent
+        // keybinding footers; a control hint alone is not a blocker.
+        let mech = profile(AgentKind::OpenCode);
+        let screen = "╭───────────────╮\n│ build · opus  │\n╰───────────────╯\nesc to cancel · enter confirm";
+        assert_eq!(
+            mech.detect_status(&ctx_screen("", screen, true, true)),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn control_plus_choices_without_a_question_is_blocked() {
+        // MCP elicitation dialogs show Accept/Decline plus a cancel footer and
+        // no question line (herdr's `mcp_elicitation_prompt`).
+        let mech = profile(AgentKind::Claude);
+        let screen = "MCP server requests your input\n❯ Accept\n  Decline\nesc to cancel";
+        assert_eq!(
+            mech.detect_status(&ctx_screen("", screen, true, true)),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn action_required_title_is_blocked_not_idle() {
+        // Codex asks for approval in the title (herdr: `osc_title_blocked`,
+        // priority 1100). The old code read "Action Required" as idle.
+        let mech = profile(AgentKind::Codex);
+        assert_eq!(
+            mech.detect_status(&ctx_full("❯ ", "Action Required", true, true)),
+            AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn static_non_spinner_title_is_idle() {
+        // Codex at its prompt: no spinner, no busy footer (herdr's generic
+        // `osc_title_idle`). The old fallback reported "working" forever.
+        let mech = profile(AgentKind::Codex);
+        assert_eq!(
+            mech.detect_status(&ctx_full("all tests pass", "codex", true, true)),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn braille_outside_the_live_region_is_not_working() {
+        // Agents print spinner glyphs into their transcript; only a spinner in
+        // the live bottom region means a turn is running.
+        let mech = profile(AgentKind::Pi);
+        let stale = (0..20)
+            .map(|i| format!("⠧ step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let plain = (0..12)
+            .map(|i| format!("log line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let screen = format!("{stale}\n{plain}");
+        assert_eq!(
+            mech.detect_status(&ctx_screen("", &screen, true, true)),
+            AgentStatus::Idle
+        );
+    }
+
+    #[test]
+    fn inserted_prompt_in_the_box_is_idle_while_the_tail_is_noise() {
+        // The prompt glyph lives in the box body. A line-oriented screen whose
+        // last tail line is redraw noise must still read idle at the prompt.
+        let mech = profile(AgentKind::Claude);
+        let screen = "done\n──────────────\n❯ \n──────────────\n  ? for shortcuts";
+        assert_eq!(
+            mech.detect_status(&ctx_screen("", screen, true, true)),
+            AgentStatus::Idle
+        );
     }
 
     #[test]

@@ -919,33 +919,29 @@ impl SessionManager {
         });
     }
 
-    /// One detection pass. Detection is tied to the agent command lifecycle:
-    /// only panes with an active agent command (armed) or an in-flight agent
-    /// lifecycle (a current snapshot — error hold, reconnect) are inspected.
-    /// Everything else is skipped entirely, so no process snapshot is taken
-    /// unless an agent is actually (or was recently) running.
+    /// One detection pass over every pane.
+    ///
+    /// Identification is process-tree based, like herdr's foreground-process
+    /// detection: a pane is inspected on every tick whether or not the shell
+    /// integration announced the command. Gating the tick on an armed command
+    /// made detection depend entirely on the shell integration — panes whose
+    /// shell never emits OSC 1337 markers (fresh install, ssh, tmux, launch
+    /// mode) showed no agent at all. Arming is now only a hint: it supplies
+    /// the booting grace window and skips waiting for a process match.
     async fn agent_watch_tick(&self) {
         let sessions: Vec<(
             i32,
             Option<u32>,
             Arc<Mutex<crate::terminal::agent::AgentDetector>>,
-            bool,
         )> = {
             let sessions = self.sessions.lock().await;
             sessions
                 .iter()
                 .map(|(id, session)| {
-                    let has_current = session
-                        .agent
-                        .try_lock()
-                        .ok()
-                        .map(|detector| detector.current.is_some())
-                        .unwrap_or(false);
                     (
                         *id,
                         session.child.process_id(),
                         Arc::clone(&session.agent),
-                        has_current,
                     )
                 })
                 .collect()
@@ -962,8 +958,7 @@ impl SessionManager {
             u64,
         )> = sessions
             .into_iter()
-            .filter(|(pane_id, _, _, has_current)| armed.contains_key(pane_id) || *has_current)
-            .map(|(pane_id, pid, detector, _)| {
+            .map(|(pane_id, pid, detector)| {
                 (
                     pane_id,
                     pid,
@@ -972,9 +967,6 @@ impl SessionManager {
                 )
             })
             .collect();
-        if active.is_empty() {
-            return;
-        }
         // `ps` is a synchronous subprocess. Running it on Tokio's executor
         // was the main source of visible lag during agent startup and under
         // multiple panes. Keep the async watch loop responsive by isolating
