@@ -238,6 +238,44 @@ function checkboxToggleChange(line: string, from: number): ChangeSpec | null {
   return { from: from + prefix.length, insert: '- [ ] ' }
 }
 
+/** Move the caret to the right-clicked position unless the click lands inside
+ *  the current selection, so a selection survives for Copy/Cut. */
+function placeCursorForContextMenu(view: EditorView, event: MouseEvent): void {
+  const pos = view.posAtCoords({ x: event.clientX, y: event.clientY })
+  if (pos == null) return
+  const insideSelection = view.state.selection.ranges.some(
+    range => !range.empty && pos >= range.from && pos <= range.to,
+  )
+  if (insideSelection) return
+  view.dispatch({ selection: { anchor: pos } })
+}
+
+/** The editor's selected text, with multi-range selections joined by newlines. */
+export function getSelectedText(view: EditorView | null): string {
+  if (!view) return ''
+  const { state } = view
+  return state.selection.ranges
+    .filter(range => !range.empty)
+    .map(range => state.sliceDoc(range.from, range.to))
+    .join('\n')
+}
+
+/** Remove every non-empty selection range (used by Cut). */
+export function deleteSelection(view: EditorView | null): boolean {
+  if (!view) return false
+  const { state } = view
+  if (state.selection.ranges.every(range => range.empty)) return false
+  view.dispatch({ ...state.replaceSelection(''), userEvent: 'delete.cut' })
+  return true
+}
+
+/** Replace the current selection(s) with pasted text. */
+export function insertClipboardText(view: EditorView | null, text: string): boolean {
+  if (!view || !text) return false
+  view.dispatch({ ...view.state.replaceSelection(text), userEvent: 'input.paste' })
+  return true
+}
+
 /** Toggle the checkbox on every line any selection range touches (⌘L). */
 export function toggleCheckbox(view: EditorView | null): boolean {
   if (!view) return false
@@ -587,6 +625,12 @@ export function useMarkdownEditor(
           }),
           EditorView.lineWrapping,
           EditorView.domEventHandlers({
+            contextmenu: (event, view) => {
+              // Keep the selection when right-clicking inside it; otherwise
+              // put the caret where the user clicked so Paste lands there.
+              placeCursorForContextMenu(view, event)
+              return false
+            },
             keydown: (event) => {
               if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
                 event.preventDefault()

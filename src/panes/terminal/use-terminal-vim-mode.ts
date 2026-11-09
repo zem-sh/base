@@ -902,7 +902,13 @@ export function useTerminalVimMode({
 
     // q is an unconditional Vim exit, even if an operator/text-object sequence
     // is currently pending. Keep it intercepted so it never reaches the PTY.
-    if (e.key?.toLowerCase?.() === 'q' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    // Ctrl+C behaves the same as q: it cancels the scrollback session and
+    // returns the viewport to the live prompt.
+    const exitKey = e.key?.toLowerCase?.() ?? ''
+    const isExitKey =
+      (exitKey === 'q' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) ||
+      (exitKey === 'c' && e.ctrlKey && !e.shiftKey && !e.metaKey && !e.altKey)
+    if (isExitKey) {
       if (pendingRef.current) {
         clearTimeout(pendingRef.current.timer)
         pendingRef.current = null

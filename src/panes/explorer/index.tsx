@@ -506,9 +506,17 @@ export function ExplorerPane({ paneId, isFocused, params }: PaneComponentProps) 
       return
     }
 
-    // 2) Launch params (pane opened with a saved preset or "Open in new pane").
+    // 2) Launch params (pane opened with a saved preset, "Open in new pane",
+    //    or a file link clicked in a terminal).
     const launch = (p as { launch?: { connectionId?: string; rootPath?: string; path?: string } } | undefined)?.launch
-    if (!launch?.connectionId) return
+    if (!launch?.path) return
+    if (!launch.connectionId) {
+      // Local file: there is no saved connection to restore, so browse its
+      // folder and let the auto-open effect preview it once the listing lands.
+      pendingOpenFileRef.current = launch.path
+      loadDirectoryRef.current(launch.path.substring(0, launch.path.lastIndexOf('/')) || '/', false)
+      return
+    }
     ;(async () => {
       try {
         const res = await addonQuery<{ connections: RemoteConnectionConfig[] }>('get_saved_connections', {})

@@ -71,10 +71,10 @@ pub fn agents_enabled() -> ConfigField {
         )
 }
 
-/// Per-agent detection settings — one enable toggle plus custom status
-/// patterns for each supported agent. Keys are `agents.<id>.enabled`,
-/// `agents.<id>.blocked` and `agents.<id>.error`, which the settings form
-/// persists as flat field names and the agent detector parses back out.
+/// Per-agent detection settings — one enable toggle plus custom blocked
+/// patterns for each supported agent. Keys are `agents.<id>.enabled` and
+/// `agents.<id>.blocked`, which the settings form persists as flat field names
+/// and the agent detector parses back out.
 ///
 /// Custom marker fields accept comma/semicolon separated phrases; leaving a
 /// field empty keeps that agent's built-in defaults.
@@ -101,14 +101,6 @@ pub fn agent_fields() -> Vec<ConfigField> {
                 .label(&format!("{} — waiting markers", display))
                 .description(&format!(
                     "Comma-separated output phrases that mean {} is waiting for your input. Empty uses built-in defaults.",
-                    display
-                )),
-        );
-        fields.push(
-            ConfigField::new(&format!("agents.{}.error", id))
-                .label(&format!("{} — error markers", display))
-                .description(&format!(
-                    "Comma-separated output phrases that mean {} failed. Empty uses built-in defaults.",
                     display
                 )),
         );

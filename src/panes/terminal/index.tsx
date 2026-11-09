@@ -41,6 +41,7 @@ import { TerminalSearchBar, type TerminalSearchState } from './search-ui'
 import { usePane, paneMetaRegistry, type PaneComponentProps } from '@zem-sh/pane'
 import { createGrpcPtyTransport } from './ws-pty-transport'
 import { useTerminalVimMode } from './use-terminal-vim-mode'
+import { installExternalLinkOpener } from './link-opening'
 
 // Access the shared paneRegistry via the global bridge so CDN-loaded
 // bundles and the host app all use the same singleton.
@@ -129,6 +130,19 @@ const OSC_TITLE_RE = /\x1b\](?:0|2);([^\x1b\x07]+)(?:\x1b\\|\x07)/g
 // Alt-screen enter/exit CSI sequences (no /g — only need one match per call)
 const ALT_SCREEN_ENTER = '\x1b[?1049h'
 const ALT_SCREEN_EXIT = '\x1b[?1049l'
+
+// Scrolling inside full-screen apps (pi, etc.).
+//
+// The terminal core forwards exactly one wheel notch to an app that owns the
+// mouse (`MouseController.sendMouseEvent` encodes `Math.sign(deltaY)`), while
+// its own scrollback path multiplies a discrete step by 3 before scrolling
+// (`scrollbar-runtime.ts`). So the shell scrolls three times as far per
+// mouse-wheel detent as a TUI does, which reads as "scrolling barely moves"
+// once the app has a long transcript. Match the scrollback speed here.
+const FULL_SCREEN_WHEEL_NOTCH_MULTIPLIER = 3
+// Browsers report a mouse-wheel detent in pixels (typically 100-120, or line
+// mode); trackpad deltas are much smaller and arrive continuously.
+const DISCRETE_WHEEL_DELTA_PX = 40
 
 function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneComponentProps) {
   const terminalRef = useRef<Terminal | null>(null)
@@ -255,6 +269,10 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     if (!el) return
     let disposed = false
 
+    // Detected links are opened with `window.open`, which a desktop webview
+    // ignores — send them to the system browser instead.
+    installExternalLinkOpener()
+
     const meta = paneMetaRegistry.get(paneId) as { cwd?: string } | undefined
 
     // Hook into PTY output to detect OSC 7 PWD changes, alt-screen state,
@@ -324,6 +342,43 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     terminalRef.current = r
     paneMetaRegistry.set(paneId, { terminal: r })
     demoRef.current = createDemoController(r)
+
+    // Full-screen apps take over the wheel once they enable mouse tracking, so
+    // the core hands them a single notch per DOM event. Replay discrete notches
+    // here to reach the shell's scrollback speed. The capture listener runs on
+    // the pane root, before the core's canvas handler, and the replayed events
+    // are tagged so this listener ignores them. Precision (trackpad) deltas and
+    // Shift+wheel (scrollback/selection) are left untouched.
+    const amplifyFullScreenWheel = (event: WheelEvent) => {
+      if ((event as WheelEvent & { __zemWheelReplay?: boolean }).__zemWheelReplay) return
+      if (!altScreenActiveRef.current || event.shiftKey || !event.deltaY) return
+      if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) return
+      const discrete = event.deltaMode === 1 || Math.abs(event.deltaY) >= DISCRETE_WHEEL_DELTA_PX
+      if (!discrete) return
+      const target = event.target
+      if (!(target instanceof Element)) return
+      for (let i = 1; i < FULL_SCREEN_WHEEL_NOTCH_MULTIPLIER; i++) {
+        const replay = new WheelEvent('wheel', {
+          deltaX: event.deltaX,
+          deltaY: event.deltaY,
+          deltaMode: event.deltaMode,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          screenX: event.screenX,
+          screenY: event.screenY,
+          ctrlKey: event.ctrlKey,
+          shiftKey: event.shiftKey,
+          altKey: event.altKey,
+          metaKey: event.metaKey,
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+        })
+        ;(replay as WheelEvent & { __zemWheelReplay?: boolean }).__zemWheelReplay = true
+        target.dispatchEvent(replay)
+      }
+    }
+    el.addEventListener('wheel', amplifyFullScreenWheel, { capture: true, passive: true })
     r.setMouseMode(mouseMode)
     r.setShaderStages(shaderStagesForPresets(activeShaders))
     void (async () => {
@@ -362,6 +417,7 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
 
     return () => {
       disposed = true
+      el.removeEventListener('wheel', amplifyFullScreenWheel, true)
       // Don't kill addon session on tab switch — it persists until pane is closed
       paneMetaRegistry.delete(paneId)
       demoRef.current?.stop()
@@ -435,22 +491,16 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     return () => window.removeEventListener('resize', queueResize)
   }, [queueResize])
 
-  // Listen for file-path clicks from the terminal and open the explorer pane
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { path?: string } | undefined
-      const path = detail?.path
-      if (!path) return
-      window.dispatchEvent(new CustomEvent('pane:new-tile', {
-        detail: {
-          kind: 'explorer',
-          name: path.split('/').pop() || path,
-          params: { launch: { path } },
-        },
-      }))
-    }
-    window.addEventListener('terminal-open-file', handler)
-    return () => window.removeEventListener('terminal-open-file', handler)
+  // Jump the viewport back to the live end of the buffer. Ctrl+C interrupts
+  // whatever is running, so the user wants to see the interrupt and the new
+  // prompt even if they were reading older scrollback.
+  const scrollToBottom = useCallback(() => {
+    const t = terminalRef.current
+    if (!t) return
+    const info = t.getScrollbackInfo()
+    const maxOffset = Math.max(0, (info.totalLines || 0) - (info.viewportLen || 0))
+    const delta = maxOffset - info.viewportOffset
+    if (delta > 0) t.scrollViewport(delta)
   }, [])
 
   useEffect(() => {
@@ -459,6 +509,12 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
       if (!isFocused) return
       // Don't open search bar when vim mode is active (vim mode handles / key)
       if (vimActive) return
+      // Ctrl+C is forwarded to the PTY by the terminal core; only add the
+      // scroll. Do not prevent or stop the event.
+      if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key?.toLowerCase() === 'c') {
+        scrollToBottom()
+        return
+      }
       const isMac = navigator.platform.toLowerCase().includes('mac')
       const mod = isMac ? e.metaKey : e.ctrlKey
       if (mod && !e.altKey && e.key === '/') {
@@ -469,7 +525,7 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     }
     window.addEventListener('keydown', handler, { capture: true })
     return () => window.removeEventListener('keydown', handler, { capture: true })
-  }, [isFocused, vimActive])
+  }, [isFocused, vimActive, scrollToBottom])
 
   const handleSearchQueryChange = useCallback((query: string) => {
     setSearchQuery(query)

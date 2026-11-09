@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePane, type PaneComponentProps, type PaneLaunchSchema } from '@zem-sh/pane'
-import { toggleCheckbox, useMarkdownEditor } from './editor'
+import { deleteSelection, getSelectedText, insertClipboardText, toggleCheckbox, useMarkdownEditor } from './editor'
 import { Toolbar } from './components/toolbar'
 import { StatusBar } from './components/status-bar'
 import { WelcomeScreen, type ComposeOptions } from './components/welcome-screen'
@@ -130,6 +130,28 @@ export function MarkdownNotesPane({ paneId, isFocused, params, theme }: PaneComp
     if (action === 'save') saveRef.current().catch(() => {})
     if (action === 'toggle-checkbox') toggleCheckbox(editorViewRef.current)
     if (action === 'new-note') startCompose()
+    if (action === 'copy') {
+      const text = getSelectedText(editorViewRef.current)
+      if (!text) { setStatus('Nothing selected'); return }
+      navigator.clipboard.writeText(text).then(() => setStatus('Copied'), () => setStatus('Copy failed'))
+    }
+    if (action === 'cut') {
+      const view = editorViewRef.current
+      const text = getSelectedText(view)
+      if (!text) { setStatus('Nothing selected'); return }
+      // Only remove the selection once the clipboard actually holds it.
+      navigator.clipboard.writeText(text).then(() => {
+        deleteSelection(view)
+        setStatus('Cut')
+      }, () => setStatus('Cut failed'))
+    }
+    if (action === 'paste') {
+      navigator.clipboard.readText().then((text) => {
+        editorViewRef.current?.focus()
+        if (!insertClipboardText(editorViewRef.current, text)) return
+        setStatus('Pasted')
+      }, () => setStatus('Paste failed'))
+    }
     // Focused existing pane received launch state (e.g. the command palette
     // picked a saved note from the addon's list action): apply it here so the
     // pane switches to the requested note instead of staying put.
@@ -570,7 +592,11 @@ export function register(): void {
     launchSchema: markdownNotesLaunchSchema,
     settingsSchema: notesSettingsSchema,
 
-    contextMenuActions: (paneId: number) => [{ label: 'Save note', shortcut: '⌘S', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'save' } })) }, { label: 'Toggle checkbox', shortcut: '⌘L', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'toggle-checkbox' } })) }, { label: 'New note', shortcut: 'n', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'new-note' } })) }],
+    contextMenuActions: (paneId: number) => [
+      { label: 'Copy', shortcut: '⌘C', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'copy' } })) },
+      { label: 'Cut', shortcut: '⌘X', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'cut' } })) },
+      { label: 'Paste', shortcut: '⌘V', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'paste' } })) },
+      { label: 'Save note', shortcut: '⌘S', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'save' } })) }, { label: 'Toggle checkbox', shortcut: '⌘L', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'toggle-checkbox' } })) }, { label: 'New note', shortcut: 'n', action: () => window.dispatchEvent(new CustomEvent('pane-action', { detail: { paneId, action: 'new-note' } })) }],
     registerBindings() { return [{ id: 'new-notes', keys: [{ key: 'n', meta: true, shift: true }], description: 'New Markdown Notes pane', action: () => window.dispatchEvent(new CustomEvent('pane:new-tile', { detail: { kind: 'notes' } })) }] },
   })
 }

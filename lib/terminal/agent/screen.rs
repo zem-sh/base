@@ -36,11 +36,6 @@ const MAX_COLS: u32 = 1000;
 #[derive(Debug)]
 pub struct Screen {
     rows: BTreeMap<u32, BTreeMap<u32, char>>,
-    /// Last paint time per row (Unix ms) — used to distinguish a *current*
-    /// status row from stale text that lingers in a TUI's on-screen
-    /// scrollback (e.g. Pi keeps a failed request's error line visible even
-    /// after the model recovers and renders new content below it).
-    row_paint_ms: BTreeMap<u32, u64>,
     row: u32,
     col: u32,
     saved_cursor: Option<(u32, u32)>,
@@ -52,9 +47,6 @@ pub struct Screen {
     /// length cap). Reset on entry/termination — a chunk boundary must not
     /// confuse it.
     osc_len: usize,
-    /// Unix ms of the current feed batch — stamped onto every row painted or
-    /// erased by it, so recency can be compared across rows and batches.
-    feed_ms: u64,
     /// Unix ms when the visible content last changed.
     pub last_change_ms: u64,
 }
@@ -63,14 +55,12 @@ impl Screen {
     pub fn new(now_ms: u64) -> Self {
         Self {
             rows: BTreeMap::new(),
-            row_paint_ms: BTreeMap::new(),
             row: 0,
             col: 0,
             saved_cursor: None,
             pending: Vec::new(),
             in_osc: false,
             osc_len: 0,
-            feed_ms: now_ms,
             last_change_ms: now_ms,
         }
     }
@@ -78,7 +68,6 @@ impl Screen {
     /// Feed a chunk of raw PTY bytes. Returns whether the visible content
     /// changed (used to skip re-rendering when nothing was painted).
     pub fn feed(&mut self, data: &[u8], now_ms: u64) -> bool {
-        self.feed_ms = now_ms;
         let mut buf = std::mem::take(&mut self.pending);
         buf.extend_from_slice(data);
         let mut i = 0;
@@ -160,7 +149,6 @@ impl Screen {
                     // RIS — reset to initial state.
                     b'c' => {
                         self.rows.clear();
-                        self.row_paint_ms.clear();
                         self.row = 0;
                         self.col = 0;
                         changed = true;
@@ -257,7 +245,6 @@ impl Screen {
             return;
         }
         self.rows.entry(self.row).or_default().insert(self.col, ch);
-        self.row_paint_ms.insert(self.row, self.feed_ms);
         self.col += 1;
     }
 
@@ -291,7 +278,6 @@ impl Screen {
                 _ => {
                     if !self.rows.is_empty() {
                         self.rows.clear();
-                        self.row_paint_ms.clear();
                         changed = true;
                     }
                 }
@@ -307,9 +293,6 @@ impl Screen {
                     _ => cols.clear(),
                 }
                 changed |= cols.len() != before;
-                if changed {
-                    self.row_paint_ms.insert(self.row, self.feed_ms);
-                }
             }
             b'X' => {
                 let Some(cols) = self.rows.get_mut(&self.row) else {
@@ -319,9 +302,6 @@ impl Screen {
                 let before = cols.len();
                 cols.retain(|c, _| *c < self.col || *c >= end);
                 changed |= cols.len() != before;
-                if changed {
-                    self.row_paint_ms.insert(self.row, self.feed_ms);
-                }
             }
             // Enter alternate screen: the TUI takes over a fresh surface.
             // (Exiting restores the main screen, but by then the agent
@@ -329,7 +309,6 @@ impl Screen {
             b'h' if first == 1049 => {
                 if !self.rows.is_empty() {
                     self.rows.clear();
-                    self.row_paint_ms.clear();
                     changed = true;
                 }
             }
@@ -369,7 +348,6 @@ impl Screen {
             }
             if cols.len() != before {
                 changed = true;
-                self.row_paint_ms.insert(key, self.feed_ms);
             }
         }
         changed
@@ -384,37 +362,7 @@ impl Screen {
         keys.sort_unstable();
         for key in keys.into_iter().take(self.rows.len() - MAX_ROWS) {
             self.rows.remove(&key);
-            self.row_paint_ms.remove(&key);
         }
-    }
-
-    /// Whether any *rendered* row whose text contains one of `markers` was
-    /// part of the most recent paint batch — painted within `batch_ms` of the
-    /// latest content change. Used to gate screen error markers: a TUI agent
-    /// (Pi, OpenCode) keeps old error lines in its on-screen conversation
-    /// scrollback while it recovers and renders new content below, so an
-    /// error only counts while its row is still fresh. A static screen keeps
-    /// the error current (nothing newer was painted); new content below the
-    /// error row makes it stale.
-    pub fn has_recent_marker(&self, markers: &[String], batch_ms: u64) -> bool {
-        if markers.is_empty() || self.rows.is_empty() {
-            return false;
-        }
-        let cutoff = self.last_change_ms.saturating_sub(batch_ms);
-        let mut keys: Vec<u32> = self.rows.keys().copied().collect();
-        keys.sort_unstable();
-        let start = keys.len().saturating_sub(RENDER_ROWS);
-        for &row_key in &keys[start..] {
-            let paint = self.row_paint_ms.get(&row_key).copied().unwrap_or(0);
-            if paint < cutoff {
-                continue;
-            }
-            let lower = self.row_text(&row_key).to_lowercase();
-            if markers.iter().any(|m| lower.contains(m.as_str())) {
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -546,65 +494,6 @@ mod tests {
         data.extend(b"\x1b[Hvisible");
         s.feed(&data, 0);
         assert!(s.text().contains("visible"), "got: {}", s.text());
-    }
-
-    fn markers(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn recent_marker_on_static_screen_stays_current() {
-        // Error painted once, nothing painted since: the row is still the
-        // most recent content — the marker is current even minutes later
-        // (the agent sits on the error waiting for input).
-        let mut s = Screen::new(1000);
-        s.feed("Error: 404 status code (no body)".as_bytes(), 1000);
-        assert!(s.has_recent_marker(&markers(&["error:"]), 60_000));
-    }
-
-    #[test]
-    fn recent_marker_goes_stale_after_newer_content() {
-        // The user's case: error row painted, then the agent recovers and
-        // renders a response on lower rows. The error row is now older than
-        // the latest content change — its marker must no longer count.
-        let mut s = Screen::new(1000);
-        s.feed(b"Error: 404 status code (no body)\r\nModel: minimax", 1000);
-        assert!(s.has_recent_marker(&markers(&["error:"]), 2000));
-        // New content painted well after the error batch.
-        s.feed(b"\r\n\r\nhi\r\n\r\nHi there!", 30_000);
-        assert!(!s.has_recent_marker(&markers(&["error:"]), 2000));
-    }
-
-    #[test]
-    fn retry_repaint_keeps_error_current_until_recovery() {
-        // Pi repaints the retry banner every second — the row stays within
-        // the recency window, so the error remains current.
-        let mut s = Screen::new(1000);
-        s.feed(
-            "Internal Server Error [retrying in 1s attempt #4]".as_bytes(),
-            1000,
-        );
-        s.feed(
-            "Internal Server Error [retrying in 1s attempt #5]".as_bytes(),
-            2000,
-        );
-        assert!(s.has_recent_marker(&markers(&["internal server error"]), 3000));
-        // The agent recovers and paints a response below the banner — the
-        // error row is superseded and goes stale.
-        s.feed(b"\r\n\r\nWorking...\r\nDone!", 30_000);
-        assert!(!s.has_recent_marker(&markers(&["internal server error"]), 3000));
-    }
-
-    #[test]
-    fn static_error_screen_stays_current_forever() {
-        // A genuinely stuck agent: the error is the last thing painted and
-        // nothing newer arrives. The marker stays current indefinitely (the
-        // agent is still failing, waiting for the user).
-        let mut s = Screen::new(1000);
-        s.feed("Error: 404 status code (no body)".as_bytes(), 1000);
-        for now in [5000, 30_000, 300_000] {
-            assert!(s.has_recent_marker(&markers(&["error:"]), now), "at {now}");
-        }
     }
 
     #[test]

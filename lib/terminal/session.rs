@@ -7,9 +7,12 @@ use tokio::sync::{Mutex, RwLock};
 use zem_addon_sdk::AddonContext;
 use zem_addon_sdk::OutputEvent;
 
-use crate::terminal::agent::{now_ms, setting_bool, AgentKind, AgentRegistry, AgentSnapshot};
+use crate::terminal::agent::{
+    is_viewport_navigation, now_ms, setting_bool, AgentKind, AgentRegistry, AgentSnapshot,
+};
 use crate::terminal::osc::Osc1337Event;
 use crate::terminal::pty::{self, PtySession};
+use crate::terminal::scrollback::strip_reply_queries;
 
 const DEFAULT_AUTOSAVE_INTERVAL_SECS: u64 = 10;
 
@@ -419,14 +422,19 @@ impl SessionManager {
             let output_tx = session.output_tx.clone();
             drop(sessions);
 
-            let scrollback_data = scrollback.lock().await.get_all();
+            // Replay the screen history, but without the queries the programs
+            // in it asked the terminal (colors, cursor position, sizes, device
+            // attributes). A fresh client answers those queries by writing the
+            // replies into the PTY, where they reach the idle shell as typed
+            // input and get echoed as `^[]11;rgb:…` garbage.
+            let replay = strip_reply_queries(&scrollback.lock().await.get_all());
             let mut rx = output_tx.subscribe();
 
             let (output_tx, output_rx) = mpsc::channel(256);
-            if !scrollback_data.is_empty() {
+            if !replay.is_empty() {
                 let _ = output_tx
                     .send(OutputEvent {
-                        data: scrollback_data,
+                        data: replay,
                         exited: false,
                     })
                     .await;
@@ -447,6 +455,20 @@ impl SessionManager {
     }
 
     pub async fn write_input(&self, pane_id: i32, data: &[u8]) -> Result<(), String> {
+        // A mouse-wheel report is the user scrolling a TUI's viewport. The
+        // repaint it triggers redraws transcript history (old error rows
+        // included), so tell the detector before those bytes bounce back.
+        if is_viewport_navigation(data) {
+            let detector = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(&pane_id)
+                    .map(|session| Arc::clone(&session.agent))
+            };
+            if let Some(detector) = detector {
+                detector.lock().await.note_navigation();
+            }
+        }
         let mut sessions = self.sessions.lock().await;
         let session = sessions
             .get_mut(&pane_id)

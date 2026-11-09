@@ -44,19 +44,16 @@ const QUIET_MS: u64 = 1200;
 /// with a quiet screen means the agent has finished and the idle-title update
 /// was missed (or the agent never cleared it).
 const TITLE_STALE_MS: u64 = 5000;
-/// A screen error marker counts as *current* only while its row was painted
-/// within this margin of the screen's latest content change. TUI agents (Pi,
-/// OpenCode) keep a failed request's error line in their on-screen
-/// conversation scrollback forever, even after the model recovers — without
-/// this gate, the error status could never clear. A retry counter or fresh
-/// error repaints the row continuously, so it stays current; once newer
-/// content renders below it, the row goes stale and the error clears.
-const SCREEN_ERROR_BATCH_MS: u64 = 3000;
+/// How long a viewport scroll (mouse-wheel input) suppresses re-detection.
+/// TUI agents repaint their transcript in response to a wheel report; that
+/// repaint is navigation, not new work, so the last status is held for this
+/// long.
+const NAVIGATION_WINDOW_MS: u64 = 1200;
 /// A freshly armed agent (its command just started) is treated as Idle for
-/// this long unless it shows a real working/error signal. The agent is
+/// this long unless it shows a real working signal. The agent is
 /// booting to its prompt — opening `claude`/`pi` must not flash "working"
 /// while the banner prints. Real signals (a working title spinner, screen
-/// working markers, an error) still win during the grace.
+/// working markers) still win during the grace.
 const ARMED_GRACE_MS: u64 = 5000;
 
 // ---------------------------------------------------------------------------
@@ -161,7 +158,9 @@ pub enum AgentStatus {
     /// dialog, a y/n prompt, a select menu, etc. Maps to the pane status
     /// `blocked` so it is distinguishable from a plain idle prompt.
     Blocked,
-    /// Agent failed (non-zero exit or error output at the prompt).
+    /// Agent stopped after a failure (non-zero exit). Output text alone never
+    /// produces this status — agents routinely print error words as part of
+    /// their normal work.
     Error,
 }
 
@@ -242,13 +241,9 @@ impl AgentSnapshot {
 /// * `title_fresh` — the title was updated within the staleness window. A
 ///   stale spinner title (agent finished but never cleared it) must not keep
 ///   the status Working.
-/// * `screen_error_fresh` — the screen contains an error marker on a row that
-///   was painted in the same recent batch as the latest content change. TUI
-///   agents keep stale error lines in their on-screen scrollback, so a bare
-///   marker anywhere on the screen is not enough — it must be *current*.
 /// * `armed_grace` — the agent command started within the arming grace. A
-///   just-launched agent is booting to its prompt: without a real working or
-///   error signal it reports Idle instead of falling through to the per-agent
+///   just-launched agent is booting to its prompt: without a real working
+///   signal it reports Idle instead of falling through to the per-agent
 ///   default (so opening `claude` doesn't flash "working" while it boots).
 ///
 /// Note: the interactive shell's OSC 133 command markers are *not* a status
@@ -263,12 +258,8 @@ pub struct StatusContext<'a> {
     pub quiet: bool,
     pub screen_quiet: bool,
     pub title_fresh: bool,
-    /// Whether a *current* (recently-painted) screen row carries an error
-    /// marker — computed by the detector from the screen model's row paint
-    /// times, so stale scrollback errors don't pin the status.
-    pub screen_error_fresh: bool,
     /// The agent command started within the arming grace (booting to its
-    /// prompt — treat as Idle unless a real working/error signal appears).
+    /// prompt — treat as Idle unless a real working signal appears).
     pub armed_grace: bool,
 }
 
@@ -305,10 +296,6 @@ pub trait AgentMechanism: Send + Sync {
     fn blocked_markers(&self) -> &[String] {
         &DEFAULT_BLOCKED_MARKERS
     }
-    /// Markers in the last output lines that mean "failed".
-    fn error_markers(&self) -> &[String] {
-        &DEFAULT_ERROR_MARKERS
-    }
     /// Markers that, when present on the *current screen*, mean the agent is
     /// actively working. TUI agents repaint these only while working (e.g.
     /// OpenCode's "esc to interrupt" hint, Pi's "Working..."); line-based,
@@ -336,7 +323,6 @@ pub trait AgentMechanism: Send + Sync {
         status_from_markers(
             self.prompt_markers(),
             self.blocked_markers(),
-            self.error_markers(),
             self.working_markers(),
             self.braille_working(),
             self.default_status(),
@@ -345,7 +331,7 @@ pub trait AgentMechanism: Send + Sync {
     }
     fn extract_message(&self, ctx: &StatusContext, status: AgentStatus) -> Option<String> {
         match status {
-            AgentStatus::Error => error_message(ctx.tail, ctx.screen, self.error_markers()),
+            AgentStatus::Error => error_message(ctx.tail, ctx.screen),
             AgentStatus::Blocked => blocked_message(ctx.tail, ctx.screen, self.blocked_markers()),
             AgentStatus::Idle => {
                 if self.default_status() == AgentStatus::Idle {
@@ -541,28 +527,25 @@ fn builtin_profiles() -> Vec<AgentProfile> {
 // ---------------------------------------------------------------------------
 
 /// Per-agent configuration read from the addon settings (declared as
-/// `agents.<id>.enabled | blocked | error` config fields). Custom status
-/// markers replace the builtin defaults when non-empty.
+/// `agents.<id>.enabled | blocked` config fields). Custom blocked markers
+/// replace the builtin defaults when non-empty.
 #[derive(Debug, Clone)]
 pub struct AgentSettings {
     /// Whether detection is enabled for this agent (default `true`).
     pub enabled: bool,
     /// Custom "waiting for input" markers, comma/newline separated.
     pub blocked: Vec<String>,
-    /// Custom "failed" markers, comma/newline separated.
-    pub error: Vec<String>,
 }
 
 impl AgentSettings {
     /// Parse per-agent settings from the addon settings object. The settings
-    /// form persists flat field names, so keys are `agents.<id>.enabled`,
-    /// `agents.<id>.blocked` and `agents.<id>.error`. Boolean values may arrive
-    /// as real booleans or as the strings `"true"/"false"` the form emits.
+    /// form persists flat field names, so keys are `agents.<id>.enabled` and
+    /// `agents.<id>.blocked`. Boolean values may arrive as real booleans or as
+    /// the strings `"true"/"false"` the form emits.
     pub fn from_settings(settings: &serde_json::Value, agent_id: &str) -> Self {
         Self {
             enabled: setting_bool(settings, &format!("agents.{}.enabled", agent_id), true),
             blocked: parse_markers(settings.get(&format!("agents.{}.blocked", agent_id))),
-            error: parse_markers(settings.get(&format!("agents.{}.error", agent_id))),
         }
     }
 }
@@ -629,13 +612,6 @@ impl AgentMechanism for ConfiguredMechanism {
             self.inner.blocked_markers()
         } else {
             &self.settings.blocked
-        }
-    }
-    fn error_markers(&self) -> &[String] {
-        if self.settings.error.is_empty() {
-            self.inner.error_markers()
-        } else {
-            &self.settings.error
         }
     }
     fn working_markers(&self) -> &[String] {
@@ -841,69 +817,6 @@ static DEFAULT_WORKING_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
     .collect()
 });
 
-static DEFAULT_ERROR_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    [
-        "✖",
-        "✗",
-        "❌",
-        "❎",
-        "command failed",
-        "failed to",
-        "error:",
-        "an error occurred",
-        "error occurred",
-        "traceback",
-        "syntaxerror",
-        "typeerror",
-        "referenceerror",
-        "nameerror",
-        "valueerror",
-        "keyerror",
-        "indexerror",
-        "attributeerror",
-        "importerror",
-        "modulenotfounderror",
-        "fatal:",
-        "fatal error",
-        "exited with code",
-        "unexpected error",
-        "operation failed",
-        // TUI agents surface provider failures as persistent status text
-        // (Pi retries a failed request with this on screen).
-        "internal server error",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-});
-
-/// Fatal / startup blockers: persistent banners agents print when they can't
-/// run (not logged in, missing API key, ...). Checked anywhere in the recent
-/// tail — unlike the generic error markers (last lines only) because these
-/// sit on screen above the prompt indefinitely.
-///
-/// Kept deliberately narrow: these are substring-matched across the whole
-/// recent tail *before* the working-spinner check, so a generic word like
-/// `authentication` or `unauthorized` (common in test suites and HTTP logs)
-/// would false-positive mid-work. Only full banner phrases belong here.
-static DEFAULT_FATAL_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    [
-        "not logged in",
-        "please run /login",
-        "run /login",
-        "please login",
-        "please log in",
-        "log in to continue",
-        "sign in to continue",
-        "missing api key",
-        "invalid api key",
-        "api key required",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-});
-
 /// Status decision over live terminal chrome, highest priority first.
 ///
 /// Every signal is read through a [`region`] of the *current* screen (or of
@@ -911,36 +824,32 @@ static DEFAULT_FATAL_MARKERS: LazyLock<Vec<String>> = LazyLock::new(|| {
 /// the whole buffer — that is the central rule herdr's detection manifests
 /// encode (`region` + `priority` + `all`/`any`/`not` gates). Scrollback text
 /// the agent already moved past must never decide the pane's status.
-///   1. a *current* error row on the screen, or an error line in the two
-///      non-empty lines right above the input box → error;
-///   2. fatal / startup banners ("Not logged in", "Please run /login", ...)
-///      in the live bottom region → error — they persist until the agent
-///      can actually run;
-///   3. a blocked title (Codex's "Action Required") → blocked;
-///   4. a *fresh* working spinner in the terminal title → working — the most
+///   1. a blocked title (Codex's "Action Required") → blocked;
+///   2. a *fresh* working spinner in the terminal title → working — the most
 ///      reliable "working right now" signal for title-driven agents;
-///   5. an unambiguous blocker banner in the live bottom region (per-agent
+///   3. an unambiguous blocker banner in the live bottom region (per-agent
 ///      settings replace this list) → blocked;
-///   6. a gated dialog there — question (or bare y/n) plus choices or a
+///   4. a gated dialog there — question (or bare y/n) plus choices or a
 ///      footer affordance, with nothing but dialog chrome below it → blocked;
-///   7. the agent's working markers (interrupt hints, "Working...",
+///   5. the agent's working markers (interrupt hints, "Working...",
 ///      progress bars) or, for Pi, a braille spinner in the live bottom
 ///      region → working;
-///   8. the prompt glyph in the input-box body (or as the last output line on
+///   6. the prompt glyph in the input-box body (or as the last output line on
 ///      a line-oriented screen) → idle, unless no title exists and output is
 ///      actively streaming;
-///   9. a static, non-spinner title → idle;
-///  10. a screen unchanged for the quiet window → idle;
-///  11. the arming grace → idle (a freshly launched agent is booting);
-///  12. otherwise → the per-agent default (`Working` for streaming agents,
+///   7. a static, non-spinner title → idle;
+///   8. a screen unchanged for the quiet window → idle;
+///   9. the arming grace → idle (a freshly launched agent is booting);
+///  10. otherwise → the per-agent default (`Working` for streaming agents,
 ///      `Idle` for full-screen TUI agents).
 ///
-/// Agent *exit* failures are detected via the detector's own last_exit signal
-/// once the process is gone.
+/// Output text never produces [`AgentStatus::Error`]: agents routinely print
+/// error words as part of normal work (failed tool calls, test output, source
+/// code). Error is decided by the detector from the agent's exit code once the
+/// process is gone.
 fn status_from_markers(
     prompt_markers: &[String],
     blocked_markers: &[String],
-    error_markers: &[String],
     working_markers: &[String],
     braille_working: bool,
     default_status: AgentStatus,
@@ -957,7 +866,6 @@ fn status_from_markers(
     };
     // Live regions, in herdr's sense. Nothing below matches the whole screen.
     let bottom = region::bottom_non_empty_lines(view, 12).to_lowercase();
-    let above_tail = last_non_empty_lines(region::above_prompt_box(view), 2);
     let box_body = region::prompt_box_body(view).unwrap_or("");
     let is_tui = default_status == AgentStatus::Idle;
     // The prompt glyph is only live chrome inside the input box. Without a
@@ -972,35 +880,23 @@ fn status_from_markers(
         region::last_non_empty_line(view)
     };
 
-    // 1. Errors — live chrome only. An error line sitting right above the
-    //    input box is the current turn's failure; an error the agent has
-    //    scrolled past is history. Generic error words are never matched
-    //    across the wider buffer (a failed tool call is normal agent work).
-    if ctx.screen_error_fresh || contains_any(&above_tail, error_markers) {
-        return AgentStatus::Error;
-    }
-    //    Fatal / startup banners ("Not logged in · Please run /login") stay in
-    //    the live bottom region until the agent can run.
-    if contains_any(&bottom, &DEFAULT_FATAL_MARKERS) {
-        return AgentStatus::Error;
-    }
-    // 2. A blocked title outranks every screen rule: Codex writes
+    // 1. A blocked title outranks every screen rule: Codex writes
     //    "Action Required" while it waits for approval.
     if title_is_blocked(ctx.title) {
         return AgentStatus::Blocked;
     }
-    // 3. A *fresh* working spinner in the terminal title. Stale spinners
+    // 2. A *fresh* working spinner in the terminal title. Stale spinners
     //    (agent finished but the idle-title update was missed) fall through
     //    to the quiet-screen rules below.
     if ctx.title_fresh && title_has_braille_spinner(ctx.title) {
         return AgentStatus::Working;
     }
-    // 4. Unambiguous blocker banners in the live bottom region (a permission
+    // 3. Unambiguous blocker banners in the live bottom region (a permission
     //    dialog, an elicitation banner). Per-agent settings replace this list.
     if contains_any(&bottom, blocked_markers) {
         return AgentStatus::Blocked;
     }
-    // 5. Gated dialogs — herdr's `all`/`any` shape over live regions. A
+    // 4. Gated dialogs — herdr's `all`/`any` shape over live regions. A
     //    control hint alone (`esc to cancel`, `enter confirm`) is not a
     //    blocker: agents print those in their permanent keybinding footer.
     //    It counts only as the footer/hint of a question with choices, and
@@ -1011,25 +907,25 @@ fn status_from_markers(
     if live_dialog(working_region) {
         return AgentStatus::Blocked;
     }
-    // 6. The agent's working markers in the live bottom region — plus, for Pi,
+    // 5. The agent's working markers in the live bottom region — plus, for Pi,
     //    its braille spinner: the spinner char (U+2800–U+28FF) keeps
     //    repainting for the whole thinking phase even while the adjacent text
     //    changes ("Working...", "Reading files...", ...). The region limit
     //    matters: spinner glyphs the agent printed into its transcript must
     //    not keep the pane `working` after the turn ended.
     //
-    //    Unlike the error markers (step 1), these are deliberately *not*
-    //    recency-gated: TUI agents erase the spinner/hint rows when they
-    //    finish (the idle frame repaints them), so a lingering "Working..."
-    //    can't pin the status — while a long quiet tool run (e.g. a build
-    //    that repaints nothing for seconds) must keep Working.
+    //    These are deliberately *not* recency-gated: TUI agents erase the
+    //    spinner/hint rows when they finish (the idle frame repaints them), so
+    //    a lingering "Working..." can't pin the status — while a long quiet
+    //    tool run (e.g. a build that repaints nothing for seconds) must keep
+    //    Working.
     let screen_working = (!working_markers.is_empty()
         && contains_any(&working_region.to_lowercase(), working_markers))
         || (braille_working && has_braille(working_region));
     if screen_working {
         return AgentStatus::Working;
     }
-    // 7. At the input prompt. The prompt glyph belongs to the box body
+    // 6. At the input prompt. The prompt glyph belongs to the box body
     //    (herdr's `prompt_box_body` region) or, on a line-oriented screen, to
     //    the last output line — never to a `❯` the agent echoed mid-screen.
     //    Working chrome was already consumed above, so a visible prompt here
@@ -1044,7 +940,7 @@ fn status_from_markers(
         }
         return AgentStatus::Working;
     }
-    // 8. A static title. `✳` is Claude's explicit idle prefix; herdr's Codex
+    // 7. A static title. `✳` is Claude's explicit idle prefix; herdr's Codex
     //    manifest keys the same state off any title that carries neither the
     //    working spinner nor the blocked banner. Without the general rule, a
     //    known agent whose title does not animate while idle fell through to
@@ -1052,16 +948,16 @@ fn status_from_markers(
     if title_is_idle(ctx.title) {
         return AgentStatus::Idle;
     }
-    // 9. A static screen — TUI agents stop redrawing when they're done; the
+    // 8. A static screen — TUI agents stop redrawing when they're done; the
     //    reconstructed screen content (not cursor blinks) has been unchanged
     //    for the quiet window, so the agent is waiting.
     if ctx.screen_quiet {
         return AgentStatus::Idle;
     }
-    // 10. Per-agent default. A freshly armed agent is booting to its prompt —
+    // 9. Per-agent default. A freshly armed agent is booting to its prompt —
     //    no signal yet must read Idle, not the (Working) default, so opening
-    //    an agent never flashes "working". Real work/error signals already
-    //    returned above and win during the grace.
+    //    an agent never flashes "working". Real work signals already returned
+    //    above and win during the grace.
     if ctx.armed_grace {
         return AgentStatus::Idle;
     }
@@ -1093,13 +989,6 @@ fn contains_any(text: &str, markers: &[String]) -> bool {
 
 fn contains_any_str(text: &str, markers: &[&str]) -> bool {
     markers.iter().any(|m| text.contains(m))
-}
-
-/// The last `count` non-empty lines of `text`, lowercased and joined.
-fn last_non_empty_lines(text: &str, count: usize) -> String {
-    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
-    let start = lines.len().saturating_sub(count);
-    lines[start..].join("\n").to_lowercase()
 }
 
 fn has_braille(text: &str) -> bool {
@@ -1238,26 +1127,12 @@ fn blocked_message(tail: &str, screen: &str, markers: &[String]) -> Option<Strin
     tail_message(live)
 }
 
-/// Message for the error state: the most recent line carrying an error
-/// marker (so a persistent banner like "Not logged in · Please run /login"
-/// surfaces instead of the prompt that sits below it), falling back to the
-/// last visible lines. Scans the current screen first (TUI agents paint
-/// persistent error status text there), then the tail.
-fn error_message(tail: &str, screen: &str, markers: &[String]) -> Option<String> {
-    // Describe live chrome only — the live bottom region, not the scrollback.
+/// Message for the error state: the most recent visible lines (the agent has
+/// stopped, so its final output is the useful context). Prefers the current
+/// screen (TUI agents' visible state), falling back to the tail.
+fn error_message(tail: &str, screen: &str) -> Option<String> {
     let view = if screen.trim().is_empty() { tail } else { screen };
-    let live = region::bottom_non_empty_lines(view, 12);
-    for line in live.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let lower = trimmed.to_lowercase();
-        if contains_any(&lower, markers) || contains_any(&lower, &DEFAULT_FATAL_MARKERS) {
-            return Some(truncate_message(trimmed));
-        }
-    }
-    tail_message(live)
+    tail_message(region::bottom_non_empty_lines(view, 12))
 }
 
 fn truncate_message(text: &str) -> String {
@@ -1338,6 +1213,61 @@ pub fn strip_ansi(input: &str) -> String {
     out
 }
 
+/// Whether raw PTY input carries a mouse-wheel report — the client scrolling a
+/// TUI's viewport. Wheel reports are the only input that makes an agent redraw
+/// transcript history, so they are how the detector tells navigation from new
+/// work.
+///
+/// Encodings: SGR (`ESC [ < 64…67 ; … M`), X10/UTF-8 (`ESC [ M` followed by a
+/// button byte carrying the wheel bit) and urxvt (`ESC [ 96/97 ; … M`).
+pub fn is_viewport_navigation(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] != 0x1b || data[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        match data[i + 2] {
+            b'<' => {
+                // SGR wheel buttons are 64..=67 plus modifier bits.
+                let (value, next) = parse_number(data, i + 3);
+                if value.is_some_and(|v| (64..128).contains(&v))
+                    && data.get(next) == Some(&b';')
+                {
+                    return true;
+                }
+            }
+            b'M' => {
+                // X10/UTF-8: the button byte is 32 + 64/65 for wheel up/down.
+                if data.get(i + 3).is_some_and(|&cb| cb & 0b0110_0000 == 0b0110_0000) {
+                    return true;
+                }
+            }
+            _ => {
+                // urxvt: ESC [ 96/97 ; … M
+                let (value, next) = parse_number(data, i + 2);
+                if matches!(value, Some(96 | 97)) && data.get(next) == Some(&b';') {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn parse_number(data: &[u8], start: usize) -> (Option<u32>, usize) {
+    let mut i = start;
+    let mut value: u32 = 0;
+    let mut digits = 0;
+    while i < data.len() && data[i].is_ascii_digit() {
+        value = value.saturating_mul(10).saturating_add((data[i] - b'0') as u32);
+        i += 1;
+        digits += 1;
+    }
+    (if digits > 0 { Some(value) } else { None }, i)
+}
+
 // ---------------------------------------------------------------------------
 // Per-pane detector
 // ---------------------------------------------------------------------------
@@ -1359,6 +1289,9 @@ pub struct AgentDetector {
     last_title_ms: u64,
     /// When output bytes were last fed (the quiet/idle discriminator).
     last_output_ms: u64,
+    /// Unix ms until which a viewport scroll is in progress — re-detection is
+    /// held so a transcript repaint does not flip the pane.
+    navigation_until_ms: u64,
     /// Unix ms until which the agent is in its arming grace (just launched —
     /// booting to its prompt). See `armed()`.
     armed_until_ms: u64,
@@ -1388,6 +1321,7 @@ impl AgentDetector {
             title: String::new(),
             last_title_ms: 0,
             last_output_ms: 0,
+            navigation_until_ms: 0,
             armed_until_ms: 0,
             armed_kind: None,
             prearmed: false,
@@ -1444,8 +1378,17 @@ impl AgentDetector {
         self.title.clear();
         self.last_title_ms = 0;
         self.last_output_ms = 0;
+        self.navigation_until_ms = 0;
         self.current = None;
         self.armed_until_ms = now + ARMED_GRACE_MS;
+    }
+
+    /// Note that the client forwarded a viewport scroll (mouse-wheel report) to
+    /// the PTY. The agent repaints its transcript in response — navigation, not
+    /// new work — so `detect` holds the current status for
+    /// [`NAVIGATION_WINDOW_MS`].
+    pub fn note_navigation(&mut self) {
+        self.navigation_until_ms = now_ms() + NAVIGATION_WINDOW_MS;
     }
 
     /// Record the terminal title reported by the agent (OSC 0/2). An empty
@@ -1517,6 +1460,17 @@ impl AgentDetector {
     ) -> Option<AgentSnapshot> {
         match found {
             Some((mech, process)) => {
+                // While the user scrolls, the agent repaints transcript rows
+                // that were already handled (old errors included). Hold the
+                // last status instead of re-deriving it from the repaint, so
+                // navigation never flips the pane or fires a notification.
+                if now < self.navigation_until_ms {
+                    if let Some(current) = &self.current {
+                        if current.kind == mech.kind().id() {
+                            return Some(current.clone());
+                        }
+                    }
+                }
                 let since_ms = self
                     .current
                     .as_ref()
@@ -1532,12 +1486,6 @@ impl AgentDetector {
                     quiet: now.saturating_sub(self.last_output_ms) >= QUIET_MS,
                     screen_quiet: now.saturating_sub(self.screen.last_change_ms) >= QUIET_MS,
                     title_fresh: now.saturating_sub(self.last_title_ms) < TITLE_STALE_MS,
-                    // A screen error counts only while its row is freshly
-                    // painted — Pi/OpenCode keep old error lines in their
-                    // on-screen scrollback after recovery.
-                    screen_error_fresh: self
-                        .screen
-                        .has_recent_marker(mech.error_markers(), SCREEN_ERROR_BATCH_MS),
                     armed_grace: now < self.armed_until_ms,
                 };
                 let status = mech.detect_status(&ctx);
@@ -1565,9 +1513,7 @@ impl AgentDetector {
                 if recent_failure || in_error_grace {
                     let mut snap = cur.clone();
                     snap.status = "error".to_string();
-                    if snap.message.is_none() {
-                        snap.message = tail_message(&self.tail);
-                    }
+                    snap.message = error_message(&self.tail, &self.screen_text);
                     Some(snap)
                 } else {
                     None
@@ -1623,7 +1569,6 @@ mod tests {
             quiet: true,
             screen_quiet: false,
             title_fresh: true,
-            screen_error_fresh: false,
             armed_grace: false,
         }
     }
@@ -1641,7 +1586,6 @@ mod tests {
             quiet,
             screen_quiet: false,
             title_fresh,
-            screen_error_fresh: false,
             armed_grace: false,
         }
     }
@@ -1659,9 +1603,46 @@ mod tests {
             quiet,
             screen_quiet,
             title_fresh: true,
-            screen_error_fresh: false,
             armed_grace: false,
         }
+    }
+
+    #[test]
+    fn wheel_reports_are_viewport_navigation() {
+        // SGR wheel up/down, with and without modifiers.
+        assert!(is_viewport_navigation(b"\x1b[<64;12;3M"));
+        assert!(is_viewport_navigation(b"\x1b[<65;12;3M"));
+        assert!(is_viewport_navigation(b"\x1b[<68;12;3M"));
+        // X10/UTF-8 wheel up/down.
+        assert!(is_viewport_navigation(b"\x1b[M\x60\x2a\x03"));
+        assert!(is_viewport_navigation(b"\x1b[M\x61\x2a\x03"));
+        // Clicks, keys and other CSI sequences are not navigation.
+        assert!(!is_viewport_navigation(b"\x1b[<0;12;3M"));
+        assert!(!is_viewport_navigation(b"\x1b[<1;12;3M"));
+        assert!(!is_viewport_navigation(b"claude\r"));
+        assert!(!is_viewport_navigation(b"\x1b[A"));
+    }
+
+    #[test]
+    fn scrolling_holds_the_agent_status() {
+        let mech = profile(AgentKind::Claude);
+        let mut det = AgentDetector::new();
+        det.mark_persisted(Some(AgentSnapshot {
+            kind: "claude".to_string(),
+            display: "Claude Code".to_string(),
+            status: "idle".to_string(),
+            message: None,
+            process: Some("claude".to_string()),
+            since_ms: 1,
+            updated_ms: 1,
+        }));
+        // The TUI repaints an old error row while the user scrolls.
+        det.feed_output(b"\r\n\x1b[31merror: old failure\x1b[0m\r\n");
+        det.note_navigation();
+        let next = det
+            .detect(Some((&mech, "claude".to_string())), now_ms())
+            .expect("snapshot");
+        assert_eq!(next.status, "idle");
     }
 
     #[test]
@@ -1720,19 +1701,22 @@ mod tests {
     }
 
     #[test]
-    fn error_before_prompt_is_error_not_idle() {
-        // A fresh prompt reappears right after a failure — the error must win
-        // or the prompt would mask every error.
+    fn error_words_before_prompt_stay_idle() {
+        // Error words in the agent's output are part of normal work (failed
+        // tool calls, test output). They must not flip the pane to error while
+        // the agent is alive at its prompt.
         let mech = profile(AgentKind::Claude);
         let tail = "✖ Error: Command failed\nError: npm test exited 1\n❯ ";
-        assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Error);
+        assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Idle);
     }
 
     #[test]
-    fn trailing_error_line_is_error() {
+    fn trailing_error_output_stays_working() {
+        // The agent is still running; a trailing error line is output, not a
+        // process failure.
         let mech = profile(AgentKind::Claude);
         let tail = "Running tests...\nerror: command failed with exit code 1";
-        assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Error);
+        assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Working);
     }
 
     #[test]
@@ -1988,27 +1972,11 @@ mod tests {
     }
 
     #[test]
-    fn tui_agent_screen_error_marker_is_error() {
-        // A *freshly painted* error row on the screen is an error (the retry
-        // counter repaints the row every second, keeping it current).
-        let mech = profile(AgentKind::Pi);
-        let screen = "Internal Server Error [retrying in 1s attempt #4]";
-        let mut ctx = ctx_screen("", screen, true, false);
-        ctx.screen_error_fresh = true;
-        assert_eq!(mech.detect_status(&ctx), AgentStatus::Error);
-    }
-
-    #[test]
-    fn stale_screen_error_clears_after_recovery() {
-        // The user's case: Pi shows "Error: 404 status code (no body)" and
-        // the user then sends "hi" — the model recovers and renders a
-        // response below the error line. The error row is no longer freshly
-        // painted (new content superseded it), so the status must leave error
-        // and reflect the agent's actual state.
+    fn tui_error_words_on_screen_stay_idle() {
+        // TUI agents keep old error lines in their scrollback. Output text is
+        // not a failure signal — only the process exiting non-zero is.
         let mech = profile(AgentKind::Pi);
         let screen = "Error: 404 status code (no body)\nModel: minimax/minimax-m2.5\n\nhi\n\nHi there! How can I help you today?\n\n~/code/zem (main)\n0.0%/128k (auto)";
-        // Stale error row: the marker is on screen but the row was painted
-        // long ago — newer content renders below it.
         assert_eq!(
             mech.detect_status(&ctx_screen("", screen, true, true)),
             AgentStatus::Idle
@@ -2016,28 +1984,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_screen_error_while_working_is_running() {
-        // Even with a stale error line in the scrollback, active working
-        // markers on the screen must win (the agent recovered and is now
-        // working on the new request).
+    fn tui_error_words_do_not_beat_working_markers() {
+        // A retry banner is output; the agent is still running and its working
+        // marker is the live signal.
         let mech = profile(AgentKind::Pi);
-        let screen = "Error: 404 status code (no body)\nWorking...\n■■■■⬝⬝⬝⬝";
+        let screen = "Internal Server Error [retrying in 1s attempt #4]\nWorking...\n■■■■⬝⬝⬝⬝";
         assert_eq!(
             mech.detect_status(&ctx_screen("", screen, false, false)),
             AgentStatus::Working
         );
-    }
-
-    #[test]
-    fn fresh_screen_error_beats_working_markers() {
-        // A *current* error (row freshly painted) must beat working markers
-        // — Pi repaints the retry banner while failing, so the agent is NOT
-        // succeeding.
-        let mech = profile(AgentKind::Pi);
-        let screen = "Internal Server Error [retrying in 1s attempt #4]\nWorking...";
-        let mut ctx = ctx_screen("", screen, false, false);
-        ctx.screen_error_fresh = true;
-        assert_eq!(mech.detect_status(&ctx), AgentStatus::Error);
     }
 
     #[test]
@@ -2182,122 +2137,67 @@ mod tests {
     }
 
     #[test]
-    fn armed_grace_does_not_hide_error() {
-        // A fatal startup banner (not logged in) is an error even during the
-        // arming grace — the user must see why the agent can't run.
-        let mut d = AgentDetector::new();
-        d.arm(1000);
-        d.feed_output("Not logged in · Please run /login".as_bytes());
-        let mech = profile(AgentKind::Claude);
-        let snap = d
-            .detect(Some((&mech, "claude".to_string())), 1500)
-            .expect("detected");
-        assert_eq!(snap.status, "error");
-    }
-
-    #[test]
-    fn detector_screen_error_clears_after_recovery_bytes() {
-        // End-to-end through the detector with controlled timestamps: Pi
-        // paints an error row, then the user sends "hi" and the model
-        // recovers with a response below it — the error must clear.
+    fn detector_screen_error_words_stay_idle() {
+        // End-to-end: Pi paints an error line while still alive. Output text
+        // must not become an error status — the agent is not stopped.
         let mut d = AgentDetector::new();
         let mech = profile(AgentKind::Pi);
-
-        // t=1000: Pi paints the error frame. (Direct screen feeds bypass
-        // `feed_output`, so sync the cached render like it does.)
         d.screen
             .feed(b"Error: 404 status code (no body)\r\nModel: minimax", 1000);
         d.screen_text = d.screen.text();
         d.last_output_ms = 1000;
-        let snap = d
-            .detect(Some((&mech, "pi".to_string())), 2000)
-            .expect("detected");
-        assert_eq!(snap.status, "error", "fresh error row should be error");
-        let msg = snap.message.expect("error message");
-        assert!(msg.contains("404"), "got: {msg}");
-
-        // t=20000: the agent recovers and paints a response below the error.
-        d.screen.feed(
-            b"\r\n\r\nhi\r\n\r\nHi there! How can I help you?\r\n\r\n~/code/zem (main)",
-            20_000,
-        );
-        d.screen_text = d.screen.text();
-        d.last_output_ms = 20_000;
-        let snap = d
-            .detect(Some((&mech, "pi".to_string())), 21_000)
-            .expect("detected");
-        // Stale error + static screen → idle (the user's report: it must not
-        // stay error after the model works).
-        assert_eq!(snap.status, "idle", "stale error row must clear");
-    }
-
-    #[test]
-    fn detector_fresh_retry_error_stays_error() {
-        // The retry banner keeps being repainted — the error must persist
-        // across watch ticks while the agent keeps failing.
-        let mut d = AgentDetector::new();
-        let mech = profile(AgentKind::Pi);
-        d.screen
-            .feed(b"Internal Server Error [retrying in 1s attempt #4]", 1000);
-        d.screen_text = d.screen.text();
-        d.last_output_ms = 1000;
+        d.screen.last_change_ms = 1000;
         let snap = d
             .detect(Some((&mech, "pi".to_string())), 1500)
             .expect("detected");
-        assert_eq!(snap.status, "error");
-        // Repainted attempt counter keeps the row current.
-        d.screen
-            .feed(b"Internal Server Error [retrying in 1s attempt #5]", 2500);
-        d.screen_text = d.screen.text();
-        d.last_output_ms = 2500;
-        let snap = d
-            .detect(Some((&mech, "pi".to_string())), 3000)
-            .expect("detected");
-        assert_eq!(snap.status, "error", "active retry must stay error");
+        assert_eq!(snap.status, "idle");
     }
 
     #[test]
-    fn benign_auth_words_in_output_stay_running() {
+    fn detector_retry_banner_while_running_stays_working() {
+        // Pi repaints a retry banner and its working spinner — the live
+        // working marker wins; the banner is output, not a process failure.
+        let mut d = AgentDetector::new();
+        let mech = profile(AgentKind::Pi);
+        d.screen.feed(
+            b"Internal Server Error [retrying in 1s attempt #4]\r\nWorking...",
+            1000,
+        );
+        d.screen_text = d.screen.text();
+        d.last_output_ms = 1000;
+        d.screen.last_change_ms = 1000;
+        let snap = d
+            .detect(Some((&mech, "pi".to_string())), 1500)
+            .expect("detected");
+        assert_eq!(snap.status, "working");
+    }
+
+    #[test]
+    fn auth_words_in_output_stay_running() {
         // "authentication" / "unauthorized" are common in test suites and
-        // HTTP client output during legit agent work — they must NOT trip the
-        // fatal-marker path (only full banner phrases do).
+        // HTTP client output during legit agent work.
         let mech = profile(AgentKind::Claude);
         let tail = "Running auth tests...\n\u{2713} unauthorized response handled\n\u{2713} authentication flow passed";
         assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Working);
     }
 
     #[test]
-    fn not_logged_in_banner_is_error() {
-        // The user's real case: a fresh Claude that isn't logged in shows a
-        // persistent "Not logged in · Please run /login" banner above the
-        // prompt — that must surface as error, not running/idle.
+    fn not_logged_in_banner_is_not_an_error_while_running() {
+        // A login banner is agent output while the process is alive. Only a
+        // non-zero exit makes the pane error.
         let mech = profile(AgentKind::Claude);
         let tail = "  Not logged in · Please run /login\n❯ hi";
-        assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Error);
+        assert_eq!(mech.detect_status(&ctx(tail)), AgentStatus::Idle);
     }
 
     #[test]
-    fn fatal_marker_beats_idle_title() {
-        // Even with an idle "✳" title, a fatal banner must win.
-        let mech = profile(AgentKind::Claude);
-        let tail = "  Please run /login to continue\n❯ ";
-        assert_eq!(
-            mech.detect_status(&ctx_full(tail, "✳ Claude Code", true, true)),
-            AgentStatus::Error
-        );
-    }
-
-    #[test]
-    fn error_message_surfaces_banner_line() {
-        // The error message should carry the banner line, not the prompt that
-        // sits below it.
+    fn error_message_uses_final_output() {
         let mech = profile(AgentKind::Claude);
         let tail = "  Not logged in · Please run /login\n❯ hi";
         let msg = mech
             .extract_message(&ctx(tail), AgentStatus::Error)
             .expect("error message");
         assert!(msg.contains("Not logged in"), "got: {msg}");
-        assert!(!msg.contains("❯"), "got: {msg}");
     }
 
     #[test]
@@ -2442,17 +2342,18 @@ mod tests {
     #[test]
     fn detector_keeps_error_for_grace_period() {
         let mut d = AgentDetector::new();
-        d.feed_output(b"error: command failed");
+        d.feed_output("\u{276f} ".as_bytes());
+        d.last_output_ms = 0;
         let mech = profile(AgentKind::Codex);
         let snap = d
-            .detect(Some((&mech, "codex".to_string())), 1000)
+            .detect(Some((&mech, "codex".to_string())), 2000)
             .expect("detected");
-        assert_eq!(snap.status, "error");
+        assert_eq!(snap.status, "idle");
         d.mark_persisted(Some(snap));
 
-        // Failure exit shortly after -> still error.
+        // Failure exit shortly after -> error.
         d.on_cmd_end(1);
-        let next = d.detect(None, 2000);
+        let next = d.detect(None, 3000);
         let next = next.expect("kept during failure window");
         assert_eq!(next.status, "error");
 
@@ -2469,7 +2370,6 @@ mod tests {
         let settings = serde_json::json!({
             "agents.claude.enabled": "false",
             "agents.codex.blocked": "custom wait marker, another one",
-            "agents.codex.error": "custom failure",
         });
         registry.configure(&settings);
 
@@ -2487,12 +2387,7 @@ mod tests {
             codex.detect_status(&ctx("custom wait marker")),
             AgentStatus::Blocked
         );
-        assert_eq!(
-            codex.detect_status(&ctx("custom failure")),
-            AgentStatus::Error
-        );
-        // The builtin "error:" marker no longer matches — replaced by the
-        // custom set.
+        // Output text never maps to error.
         assert_eq!(
             codex.detect_status(&ctx("error: something")),
             AgentStatus::Working
@@ -2655,17 +2550,14 @@ mod tests {
         let settings = serde_json::json!({
             "agents.grok.enabled": true,
             "agents.grok.blocked": "hold on, just a sec",
-            "agents.grok.error": "boom; exploded",
         });
         let s = AgentSettings::from_settings(&settings, "grok");
         assert!(s.enabled);
         assert_eq!(s.blocked, vec!["hold on", "just a sec"]);
-        assert_eq!(s.error, vec!["boom", "exploded"]);
 
         let unset = AgentSettings::from_settings(&settings, "claude");
         assert!(unset.enabled, "unconfigured agents default to enabled");
         assert!(unset.blocked.is_empty());
-        assert!(unset.error.is_empty());
     }
 
     #[test]
