@@ -9,9 +9,9 @@
 # uploaded first (base-macos → "base"), before the two manifest files
 # (zem-addon-manifest.toml → "zem-addon", pane-manifest.toml → "pane").
 #
-# The terminal font files are uploaded too (flattened to base names). zem's
-# current extension installer only fetches a pane's entry/style, so they are
-# not consumed yet — see README → "Font assets caveat" / "zem host integration".
+# The terminal font files and the standalone `terminal.wasm` core are uploaded
+# too (flattened to base names). Both are emitted by `new URL(...)` from the
+# bundle and must sit next to it under `assets/` in the installed extension.
 name: Release
 
 on:
@@ -107,6 +107,7 @@ jobs:
           test -s assets/zem-addon-manifest.toml
           test -s assets/pane-manifest.toml
           test -s assets/index.js
+          test -s assets/terminal.wasm
           # At least the JetBrains Mono family must be present.
           test -f assets/JetBrainsMonoNLNerdFontMono-Regular.ttf
       - name: Create release and upload assets in order
@@ -117,7 +118,7 @@ jobs:
           gh release create "$TAG" --draft --title "$TAG" --generate-notes
           # ORDER MATTERS — platform binaries first (addon name inference),
           # then the addon manifest, then the pane extension files.
-          for f in base-macos base-linux zem-addon-manifest.toml pane-manifest.toml index.js; do
+          for f in base-macos base-linux zem-addon-manifest.toml pane-manifest.toml index.js terminal.wasm; do
             gh release upload "$TAG" "assets/$f"
           done
           # Fonts last (flat assets; see the header note).
