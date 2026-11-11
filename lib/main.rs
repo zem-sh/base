@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .version("1.0.0")
         .description("Zem base panes: terminal, explorer, stats, version control, notes and status items")
         .min_zem_version("0.1.0")
+        .require_zem_capability("notification.unfocused")
         .author("zem")
         // ── Actions ────────────────────────────────────────────────────────
         .action(general::actions::server_time())

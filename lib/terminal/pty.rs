@@ -109,8 +109,14 @@ impl OscTitleParser {
         let mut i = 0;
         while i < data.len() {
             if self.partial.is_none() {
-                // Look for the next OSC start (`ESC ]`).
-                if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b']' {
+                // Look for the next OSC start (`ESC ]`). Most PTY output is
+                // plain text, so let memchr skip it instead of testing every
+                // byte.
+                match memchr::memchr(0x1b, &data[i..]) {
+                    Some(rel) => i += rel,
+                    None => break,
+                }
+                if i + 1 < data.len() && data[i + 1] == b']' {
                     self.partial = Some(Vec::new());
                     i += 2;
                 } else {

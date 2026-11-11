@@ -18,14 +18,26 @@ const DEFAULT_AUTOSAVE_INTERVAL_SECS: u64 = 10;
 
 pub const DEFAULT_SCROLLBACK_SIZE: usize = 10 * 1024 * 1024;
 
-/// How often the agent detection loop inspects process trees and output tails.
-/// How often the agent watch loop re-identifies and re-derives pane status.
-/// Deliberately fast (400ms): full-screen TUI agents like Pi keep their
-/// working signal (the `⠋ Working...` braille spinner) on screen only for the
-/// duration of each request — for a fast model that window can be ~1s — so a
-/// slower tick would often land entirely outside it and "working" would never
-/// be persisted.
-const AGENT_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+/// Hard cap on the scrollback replayed to a newly attached client. Users can
+/// configure a larger scrollback, but replay is copied and pushed through the
+/// addon socket on every attach, so the initial screen stays bounded at the
+/// default size.
+const MAX_REPLAY_BYTES: usize = DEFAULT_SCROLLBACK_SIZE;
+
+/// Fast agent-watch cadence, used while something can change imminently: a
+/// pane is armed for an agent command (the process may still be booting) or a
+/// detected agent is not idle. Deliberately fast (400ms): full-screen TUI
+/// agents like Pi keep their working signal (the `⠋ Working...` braille
+/// spinner) on screen only for the duration of each request — for a fast model
+/// that window can be ~1s — so a slower tick would often land entirely
+/// outside it and "working" would never be persisted.
+const AGENT_WATCH_INTERVAL_FAST: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Idle agent-watch cadence. With no armed command and no agent detected there
+/// is nothing time-sensitive to observe, so the loop backs off to one `ps`
+/// snapshot every two seconds instead of paying for five per second in every
+/// open terminal. An arm wakes it immediately via `watch_kick`.
+const AGENT_WATCH_INTERVAL_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long an armed pane tolerates the agent process not showing up in the
 /// process snapshot before the arm is dropped. Must comfortably outlast slow
@@ -78,6 +90,10 @@ pub struct SessionManager {
     /// the final clear win over an older persistence operation.
     agent_write_locks: Arc<Mutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>>,
     last_agents_view: Arc<Mutex<Option<String>>>,
+    /// Wakes the agent watch loop early (when a pane arms an agent command or
+    /// a session is created) so startup detection never waits out the idle
+    /// cadence.
+    watch_kick: Arc<tokio::sync::Notify>,
 }
 
 impl SessionManager {
@@ -94,6 +110,7 @@ impl SessionManager {
             agent_generations: Arc::new(Mutex::new(HashMap::new())),
             agent_write_locks: Arc::new(Mutex::new(HashMap::new())),
             last_agents_view: Arc::new(Mutex::new(None)),
+            watch_kick: Arc::new(tokio::sync::Notify::new()),
         };
         mgr.spawn_agent_watch();
         mgr
@@ -325,6 +342,9 @@ impl SessionManager {
         // Store session
         self.sessions.lock().await.insert(pane_id, session);
         tracing::info!("created PTY session for pane {}", pane_id);
+        // Inspect the new pane right away (launch-mode agents paint their
+        // first frame immediately; a shell pane should register its process).
+        self.watch_kick.notify_one();
 
         // A pane launched directly with an agent command arms detection up
         // front — there is no shell integration involved, so the process tree
@@ -426,8 +446,11 @@ impl SessionManager {
             // in it asked the terminal (colors, cursor position, sizes, device
             // attributes). A fresh client answers those queries by writing the
             // replies into the PTY, where they reach the idle shell as typed
-            // input and get echoed as `^[]11;rgb:…` garbage.
-            let replay = strip_reply_queries(&scrollback.lock().await.get_all());
+            // input and get echoed as `^[]11;rgb:…` garbage. Replay is capped:
+            // a user-configured huge scrollback must not stall attach.
+            let replay = strip_reply_queries(
+                &scrollback.lock().await.get_tail(MAX_REPLAY_BYTES),
+            );
             let mut rx = output_tx.subscribe();
 
             let (output_tx, output_rx) = mpsc::channel(256);
@@ -528,25 +551,42 @@ impl SessionManager {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let sessions = sessions.lock().await;
-                if let Some(session) = sessions.get(&pane_id) {
-                    if !session
-                        .reader_running
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        break;
+                // Clone the buffer handle and release the session map before
+                // any await: the host RPC can take a while and must not block
+                // the manager (create/close/resize need the same map).
+                let (scrollback, running) = {
+                    let sessions = sessions.lock().await;
+                    match sessions.get(&pane_id) {
+                        Some(session) => (
+                            Arc::clone(&session.scrollback),
+                            session
+                                .reader_running
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        None => break,
                     }
-                    let scrollback = session.scrollback.lock().await;
-                    let data = scrollback.get_all();
-                    drop(scrollback);
-                    if data.is_empty() {
+                };
+                if !running {
+                    break;
+                }
+                // Only copy and persist when the reader actually wrote since
+                // the last successful save. An idle terminal otherwise paid a
+                // full-buffer copy plus a host round-trip every interval.
+                let (version, data) = {
+                    let scrollback = scrollback.lock().await;
+                    if !scrollback.is_dirty() {
                         continue;
                     }
-                    if let Err(e) = ctx.set_pane_data(pane_id, "scrollback", &data).await {
-                        tracing::warn!("Scrollback autosave failed for pane {}: {}", pane_id, e);
+                    (scrollback.version(), scrollback.get_all())
+                };
+                if data.is_empty() {
+                    continue;
+                }
+                match ctx.set_pane_data(pane_id, "scrollback", &data).await {
+                    Ok(()) => scrollback.lock().await.mark_saved(version),
+                    Err(e) => {
+                        tracing::warn!("Scrollback autosave failed for pane {}: {}", pane_id, e)
                     }
-                } else {
-                    break;
                 }
             }
         });
@@ -858,6 +898,8 @@ impl SessionManager {
             }
         };
         if is_new {
+            // Skip the idle wait: the agent process is booting right now.
+            self.watch_kick.notify_one();
             let generation = self.bump_agent_generation(pane_id).await;
             if let Some(session) = self.sessions.lock().await.get(&pane_id) {
                 session.agent.lock().await.confirm_arm(kind, now_ms());
@@ -932,13 +974,41 @@ impl SessionManager {
     fn spawn_agent_watch(&self) {
         let this = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(AGENT_WATCH_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                // Tick first: startup should inspect panes immediately instead
+                // of waiting out the idle cadence.
                 this.agent_watch_tick().await;
+                let delay = this.agent_watch_cadence().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = this.watch_kick.notified() => {}
+                }
             }
         });
+    }
+
+    /// Delay before the next detection pass. Fast while a pane is armed (the
+    /// agent process may still be booting) or any agent is currently detected
+    /// (its working/idle signal can flip within a second — see
+    /// `AGENT_WATCH_INTERVAL_FAST`); idle otherwise, so plain shells do not pay
+    /// a `ps` snapshot five times a second.
+    async fn agent_watch_cadence(&self) -> std::time::Duration {
+        if !self.agent_arms.lock().await.is_empty() {
+            return AGENT_WATCH_INTERVAL_FAST;
+        }
+        let detectors: Vec<Arc<Mutex<crate::terminal::agent::AgentDetector>>> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .map(|session| Arc::clone(&session.agent))
+                .collect()
+        };
+        for detector in detectors {
+            if detector.lock().await.current.is_some() {
+                return AGENT_WATCH_INTERVAL_FAST;
+            }
+        }
+        AGENT_WATCH_INTERVAL_IDLE
     }
 
     /// One detection pass over every pane.
@@ -1058,8 +1128,10 @@ impl SessionManager {
             if !det.changed(&next) {
                 continue;
             }
-            let error_transition = matches!(&next, Some(s) if s.status == "error")
-                && det.current.as_ref().map(|c| c.status.as_str()) != Some("error");
+            let status_transition = next.as_ref().is_some_and(|snapshot| {
+                det.current.as_ref().map(|current| current.status.as_str())
+                    != Some(snapshot.status.as_str())
+            });
             drop(det);
 
             // The snapshot is only recorded as persisted *after* the host
@@ -1074,8 +1146,8 @@ impl SessionManager {
                         continue;
                     }
                     if self.persist_agent(pane_id, &snapshot, generation).await {
-                        if error_transition {
-                            self.notify_agent_error(pane_id, &snapshot).await;
+                        if status_transition {
+                            self.notify_agent_status(pane_id, &snapshot).await;
                         }
                         let write_lock = self.agent_write_lock(pane_id).await;
                         let _write_guard = write_lock.lock().await;
@@ -1328,18 +1400,22 @@ impl SessionManager {
         true
     }
 
-    async fn notify_agent_error(&self, pane_id: i32, snapshot: &AgentSnapshot) {
-        let body = snapshot
-            .message
-            .clone()
-            .unwrap_or_else(|| "Agent exited with an error".to_string());
+    async fn notify_agent_status(&self, pane_id: i32, snapshot: &AgentSnapshot) {
+        let (label, level) = match snapshot.status.as_str() {
+            "working" => ("working", "info"),
+            "idle" => ("waiting for input", "info"),
+            "blocked" => ("needs your input", "warning"),
+            "error" => ("stopped with an error", "error"),
+            _ => return,
+        };
+        let body = snapshot.message.as_deref().unwrap_or(label);
         let _ = self
             .ctx
-            .notify(
+            .notify_if_unfocused(
                 pane_id,
-                &format!("{} error", snapshot.display),
-                &body,
-                "error",
+                &format!("{} {label}", snapshot.display),
+                body,
+                level,
                 false,
                 None,
             )

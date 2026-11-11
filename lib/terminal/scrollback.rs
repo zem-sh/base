@@ -12,6 +12,11 @@ pub struct ScrollbackBuffer {
     data: VecDeque<u8>,
     len: usize,
     max_capacity: usize,
+    /// Bumped on every write so the autosave loop can tell whether the bytes it
+    /// snapshotted (and then wrote to the host) are already superseded.
+    version: u64,
+    /// Version last persisted to the host. Autosave is skipped while equal.
+    saved_version: u64,
 }
 
 impl ScrollbackBuffer {
@@ -20,6 +25,8 @@ impl ScrollbackBuffer {
             data: VecDeque::with_capacity(capacity.min(INITIAL_SCROLLBACK_CAPACITY)),
             len: 0,
             max_capacity: capacity,
+            version: 0,
+            saved_version: 0,
         }
     }
 
@@ -34,6 +41,7 @@ impl ScrollbackBuffer {
             self.data.drain(..excess);
             self.len = self.max_capacity;
         }
+        self.version = self.version.wrapping_add(1);
     }
 
     pub fn get_all(&self) -> Vec<u8> {
@@ -42,6 +50,59 @@ impl ScrollbackBuffer {
         let (a, b) = self.data.as_slices();
         out.extend_from_slice(a);
         out.extend_from_slice(b);
+        out
+    }
+
+    /// Whether bytes changed since the last successful autosave.
+    pub fn is_dirty(&self) -> bool {
+        self.version != self.saved_version
+    }
+
+    /// Current write version, captured alongside a snapshot so a concurrent
+    /// write during the host round-trip is not marked as saved.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Mark a snapshot version as persisted. A newer write leaves the buffer
+    /// dirty so the next tick still saves it.
+    pub fn mark_saved(&mut self, version: u64) {
+        if version == self.version {
+            self.saved_version = version;
+        }
+    }
+
+    /// Copy at most the last `max_bytes`, preferring to start on a line
+    /// boundary. Used to bound reconnect replays: a huge scrollback must not
+    /// be copied and pushed through the addon socket in one go.
+    pub fn get_tail(&self, max_bytes: usize) -> Vec<u8> {
+        if max_bytes == 0 || self.len <= max_bytes {
+            return self.get_all();
+        }
+        let start = self.len - max_bytes;
+        let mut skip = 0;
+        // If the cap lands mid-line, resume after the first newline. If the
+        // tail is one giant line (a full-screen TUI often is), keep it as-is
+        // rather than returning nothing.
+        let mut on_boundary = false;
+        let mut iter = self.data.range(start..);
+        if let Some(&first) = iter.next() {
+            if first == b'\n' {
+                on_boundary = true;
+            } else {
+                for &b in iter {
+                    skip += 1;
+                    if b == b'\n' {
+                        skip += 1; // start after the newline
+                        on_boundary = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let from = if on_boundary { start + skip } else { start };
+        let mut out = Vec::with_capacity(self.len - from);
+        out.extend(self.data.range(from..).copied());
         out
     }
 }

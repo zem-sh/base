@@ -10,7 +10,7 @@ name = "addon"
 path = "lib/main.rs"
 
 [dependencies]
-zem-addon-sdk = "0.1.0"
+zem-addon-sdk = "0.1.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +26,8 @@ starship-battery = "0.11"
 
 # terminal
 portable-pty = "0.8"
+# Byte scanning for OSC/CWD/agent parsers on the PTY reader hot path.
+memchr = "2"
 
 # version control
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
@@ -48,4 +50,6 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
-opt-level = "s"
+# Speed, not size: the PTY reader parses every byte of terminal output on
+# several passes (OSC/CWD/agent detection), so this is a hot loop.
+opt-level = 3

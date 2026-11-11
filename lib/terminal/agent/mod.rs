@@ -1405,15 +1405,34 @@ impl AgentDetector {
 
     /// Append raw PTY output: reconstruct the visible screen from the raw
     /// bytes (cursor positioning), then append the sanitized text tail.
+    ///
+    /// The screen model and ANSI stripping are the expensive part of the PTY
+    /// reader, and a plain shell pane — the common case — never needs either:
+    /// detection is process-tree based and only consumes output once an agent
+    /// command is armed or already detected. `last_output_ms` is still updated
+    /// unconditionally because the quiet/idle heuristics need it.
     pub fn feed_output(&mut self, data: &[u8]) {
         let now = now_ms();
-        if self.screen.feed(data, now) {
-            self.screen_text = self.screen.text();
+        if self.tracks_output(now) {
+            if self.screen.feed(data, now) {
+                self.screen_text = self.screen.text();
+            }
+            let text = String::from_utf8_lossy(data);
+            let clean = strip_ansi(&text);
+            self.append_tail(&clean);
         }
-        let text = String::from_utf8_lossy(data);
-        let clean = strip_ansi(&text);
-        self.append_tail(&clean);
         self.last_output_ms = now;
+    }
+
+    /// Whether this pane can currently be running an agent, and therefore
+    /// whether its output needs screen/tail tracking.
+    fn tracks_output(&self, now: u64) -> bool {
+        self.current.is_some()
+            // Armed by shell integration or a launch command. The kind marker
+            // survives past the boot grace until the command ends, so the
+            // whole agent session keeps tracking.
+            || self.armed_kind.is_some()
+            || now < self.armed_until_ms
     }
 
     /// Replay saved scrollback into the text tail (e.g. after reconnect) so
@@ -2000,6 +2019,7 @@ mod tests {
         // End-to-end through the detector: feed raw Pi-style TUI bytes and
         // watch idle → running → idle as the screen content changes.
         let mut d = AgentDetector::new();
+        d.pre_arm(AgentKind::Pi, 0);
         d.feed_output("\x1b[2J\x1b[Hpi v0.83.0\n~/code/zem (main)\n0.0%/128k (auto)".as_bytes());
         d.last_output_ms = 0;
         d.screen.last_change_ms = 0;
@@ -2025,6 +2045,7 @@ mod tests {
         // End-to-end: Pi paints its braille spinner row (`⠧ Working...`)
         // while thinking — the detector must derive Running from it.
         let mut d = AgentDetector::new();
+        d.pre_arm(AgentKind::Pi, 0);
         d.feed_output("\x1b[2J\x1b[Hpi v0.83.0\n~/code/zem (main)\n0.0%/128k (auto)".as_bytes());
         d.last_output_ms = 0;
         d.screen.last_change_ms = 0;
@@ -2096,7 +2117,9 @@ mod tests {
         // A freshly armed agent is booting to its prompt: empty output must
         // read Idle (never the Running default) while in the arming grace.
         let mut d = AgentDetector::new();
-        d.arm(1000);
+        // Pre-arm with the kind so the detector tracks output (production
+        // arms through shell integration / the launch command).
+        d.pre_arm(AgentKind::Claude, 1000);
         let mech = profile(AgentKind::Claude);
         let snap = d
             .detect(Some((&mech, "claude".to_string())), 1500)
@@ -2319,6 +2342,7 @@ mod tests {
     #[test]
     fn detector_detects_then_clears() {
         let mut d = AgentDetector::new();
+        d.pre_arm(AgentKind::Claude, 0);
         d.feed_output(b"\x1b[32m\xE2\x9D\xAF \x1b[0m");
         d.last_output_ms = 0;
         let mech = profile(AgentKind::Claude);
@@ -2342,6 +2366,7 @@ mod tests {
     #[test]
     fn detector_keeps_error_for_grace_period() {
         let mut d = AgentDetector::new();
+        d.pre_arm(AgentKind::Codex, 0);
         d.feed_output("\u{276f} ".as_bytes());
         d.last_output_ms = 0;
         let mech = profile(AgentKind::Codex);

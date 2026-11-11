@@ -142,6 +142,7 @@ dependencies = [
  "dirs",
  "git2",
  "log",
+ "memchr",
  "portable-pty",
  "reqwest",
  "russh",
@@ -3880,9 +3881,9 @@ dependencies = [
 
 [[package]]
 name = "zem-addon-protocol"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffe6f1a14b817a06c0a35949d106271cdfda858c844829d4aa68c0a9b4290fa9"
+checksum = "adf785125403ddeffe6cde6e2114fd605703af87b29f55f57c1575fc5ef284b5"
 dependencies = [
  "anyhow",
  "serde",
@@ -3892,9 +3893,9 @@ dependencies = [
 
 [[package]]
 name = "zem-addon-sdk"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8412f06d91be15eb1086fd1c4cb160c3c6847ce614502ea3374b6b795b6d63b5"
+checksum = "0a89576e655722bc68db87df4280a4cd137ea8e273378b2ce74d631047bc757d"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

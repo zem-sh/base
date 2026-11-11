@@ -1,32 +1,34 @@
 pub fn detect_osc7_cwd(data: &[u8]) -> Option<String> {
-    let seq = b"\x1b]7;file://";
-    let mut i = 0;
-    while i + seq.len() <= data.len() {
-        if &data[i..i + seq.len()] == seq {
-            let start = i + seq.len();
-            let path_start = data[start..]
-                .iter()
-                .position(|&b| b == b'/')
-                .map(|p| start + p)
-                .unwrap_or(start);
-            let mut end = path_start;
-            while end < data.len() {
-                match data[end] {
-                    0x07 => {
-                        return std::str::from_utf8(&data[path_start..end])
-                            .ok()
-                            .map(|s| s.to_string());
-                    }
-                    0x1b if end + 1 < data.len() && data[end + 1] == b'\\' => {
-                        return std::str::from_utf8(&data[path_start..end])
-                            .ok()
-                            .map(|s| s.to_string());
-                    }
-                    _ => end += 1,
-                }
+    const SEQ: &[u8] = b"\x1b]7;file://";
+    let mut search = 0;
+    while let Some(rel) = memchr::memmem::find(&data[search..], SEQ) {
+        let start = search + rel + SEQ.len();
+        // Skip the authority (host) portion up to the first `/`.
+        let path_start = memchr::memchr(b'/', &data[start..])
+            .map(|p| start + p)
+            .unwrap_or(start);
+        // OSC 7 ends with BEL or ST (`ESC \`). Jump between terminators instead
+        // of inspecting every byte: directory payloads are usually short, but
+        // this runs on every PTY read.
+        let mut end = path_start;
+        while let Some(rel) = memchr::memchr2(0x07, 0x1b, &data[end..]) {
+            let pos = end + rel;
+            if data[pos] == 0x07 {
+                return std::str::from_utf8(&data[path_start..pos])
+                    .ok()
+                    .map(|s| s.to_string());
             }
+            if data.get(pos + 1) == Some(&b'\\') {
+                return std::str::from_utf8(&data[path_start..pos])
+                    .ok()
+                    .map(|s| s.to_string());
+            }
+            end = pos + 1;
         }
-        i += 1;
+        search = start;
+        if search >= data.len() {
+            break;
+        }
     }
     None
 }
@@ -113,6 +115,18 @@ impl Osc1337Parser {
                     self.payload.clear();
                     i += 1;
                     continue;
+                }
+            }
+
+            // Outside an OSC payload, skip runs of ordinary output with a
+            // vectorized search for the next ESC instead of per-byte tests.
+            if !self.pending_esc && byte != 0x1b {
+                match memchr::memchr(0x1b, &data[i..]) {
+                    Some(rel) => {
+                        i += rel;
+                        continue;
+                    }
+                    None => break,
                 }
             }
 
