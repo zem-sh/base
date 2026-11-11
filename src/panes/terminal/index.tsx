@@ -3,6 +3,9 @@ import {
   type PtyTransport,
   type TerminalFontSource,
   createDemoController,
+  createTerminalAppSession,
+  prewarmTerminalCore,
+  TERMINAL_WASM_URL,
   shaderStagesForPresets,
 } from '@zem-sh/terminal'
 
@@ -112,14 +115,16 @@ function buildFontSourcesForSelection(value: FontPresetKey, localMatcher: string
   sources.push({ type: 'url', label: 'JetBrains Mono Bold Italic', url: FONT_URL_JETBRAINS_MONO_BOLD_ITALIC })
   sources.push({ type: 'url', label: 'Symbols Nerd Font Mono', url: FONT_URL_NERD_SYMBOLS })
   sources.push({ type: 'local', label: 'Apple Symbols', matchers: ['apple symbols', 'applesymbols', 'apple symbols regular'], required: true })
-  sources.push({ type: 'url', label: 'Noto Sans Symbols 2', url: FONT_URL_NOTO_SYMBOLS })
-  sources.push({ type: 'url', label: 'Symbola', url: FONT_URL_SYMBOLA })
+  // Heavy, rarely-used fallback faces load after the first frame so the
+  // primary monospace chain paints immediately.
+  sources.push({ type: 'url', label: 'Noto Sans Symbols 2', url: FONT_URL_NOTO_SYMBOLS, defer: true })
+  sources.push({ type: 'url', label: 'Symbola', url: FONT_URL_SYMBOLA, defer: true })
   sources.push({ type: 'local', label: 'Noto Sans Canadian Aboriginal / Euphemia UCAS', matchers: ['noto sans canadian aboriginal', 'notosanscanadianaboriginal', 'euphemia ucas', 'euphemiaucas'] })
-  sources.push({ type: 'url', label: 'Noto Sans Canadian Aboriginal', url: FONT_URL_NOTO_CANADIAN_ABORIGINAL })
+  sources.push({ type: 'url', label: 'Noto Sans Canadian Aboriginal', url: FONT_URL_NOTO_CANADIAN_ABORIGINAL, defer: true })
   // Emoji + CJK come from system fonts (Local Font Access opt-in); the bundled
   // 10MB emoji + 16MB CJK fallbacks were removed — OpenMoji covers emoji here.
   sources.push({ type: 'local', label: 'Color Emoji', matchers: ['apple color emoji', 'applecoloremoji', 'segoe ui emoji', 'noto color emoji'], required: true })
-  sources.push({ type: 'url', label: 'OpenMoji', url: FONT_URL_OPENMOJI })
+  sources.push({ type: 'url', label: 'OpenMoji', url: FONT_URL_OPENMOJI, defer: true })
   sources.push({ type: 'local', label: 'CJK', matchers: ['pingfang sc', 'pingfang', 'hiragino sans gb', 'microsoft yahei', 'noto sans cjk sc', 'wenquanyi', 'source han sans'], required: true })
   return sources
 }
@@ -143,6 +148,20 @@ const FULL_SCREEN_WHEEL_NOTCH_MULTIPLIER = 3
 // Browsers report a mouse-wheel detent in pixels (typically 100-120, or line
 // mode); trackpad deltas are much smaller and arrive continuously.
 const DISCRETE_WHEEL_DELTA_PX = 40
+
+// Upper bound for PTY output held while the renderer initializes. The server
+// caps scrollback at 10 MB by default, so a little headroom keeps a reconnect
+// replay intact while still bounding a runaway launch command.
+const EARLY_PTY_OUTPUT_MAX_CHARS = 16 * 1024 * 1024
+
+// All terminal panes share one session: the WASM module, WebGPU core and font
+// resource store are then loaded/parsed once per app, not once per pane.
+// Prewarming starts the WASM fetch during app startup so the first pane does
+// not pay for download + compile when it mounts.
+const terminalSession = createTerminalAppSession({ wasmUrl: TERMINAL_WASM_URL })
+void prewarmTerminalCore(terminalSession).catch(() => {
+  // The pane's own init retries via the same session and reports the error.
+})
 
 function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneComponentProps) {
   const terminalRef = useRef<Terminal | null>(null)
@@ -169,6 +188,19 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
   const demoRef = useRef<ReturnType<typeof createDemoController> | null>(null)
   const resizeRafRef = useRef(0)
   const ptyTransportRef = useRef<PtyTransport | null>(null)
+  // Output held between "start the shell" and "the renderer can consume
+  // bytes". The core's output pipeline flushes to sendInput() on a timer and
+  // sendInput() silently drops data until the WASM terminal is ready, so
+  // without this the shell's first prompt would be lost when the PTY is
+  // started before init() — which is the whole point: boot the shell in
+  // parallel with font/WASM/GPU initialization. `sink` is the core's own
+  // onData callback, replayed on flush so its output filter still runs.
+  const ptyGateRef = useRef({
+    ready: false,
+    chunks: [] as string[],
+    bytes: 0,
+    sink: null as ((data: string) => void) | null,
+  })
 
   const renderer = useTerminalSettings(s => s.renderer)
   const fontSize = useTerminalSettings(s => s.fontSize)
@@ -259,7 +291,32 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
   const getAdaptivePtyTransport = useCallback((): PtyTransport => {
     if (!ptyTransportRef.current) {
       // Use gRPC transport for direct server connection, pass paneId
-      ptyTransportRef.current = createGrpcPtyTransport(paneId)
+      const inner = createGrpcPtyTransport(paneId)
+      const gate = ptyGateRef.current
+      // Buffer output until the renderer is ready, then hand it over in order.
+      // See the main effect: connectPty() runs before init() finishes.
+      ptyTransportRef.current = {
+        ...inner,
+        connect: (options) => {
+          gate.sink = options.callbacks.onData ?? null
+          return inner.connect({
+            ...options,
+            callbacks: {
+              ...options.callbacks,
+              onData: (data) => {
+                if (!gate.ready) {
+                  if (gate.bytes < EARLY_PTY_OUTPUT_MAX_CHARS) {
+                    gate.chunks.push(data)
+                    gate.bytes += data.length
+                  }
+                  return
+                }
+                options.callbacks.onData?.(data)
+              },
+            },
+          })
+        },
+      }
     }
     return ptyTransportRef.current
   }, [paneId])
@@ -316,6 +373,7 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     const r = new Terminal({
       root: el,
       autoInit: false,
+      session: terminalSession,
       appOptions: {
         renderer,
         fontSize,
@@ -381,29 +439,44 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     el.addEventListener('wheel', amplifyFullScreenWheel, { capture: true, passive: true })
     r.setMouseMode(mouseMode)
     r.setShaderStages(shaderStagesForPresets(activeShaders))
+
+    // Start the shell before the renderer finishes initializing. The shell's
+    // boot (rc files, prompt theme) overlaps font acquisition, WASM startup
+    // and GPU context creation instead of waiting for all of it. Output that
+    // lands in the meantime is buffered by the gated transport above and
+    // replayed once init() resolves.
+    const gate = ptyGateRef.current
+    gate.ready = false
+    gate.chunks = []
+    gate.bytes = 0
+    r.connectPty('', meta?.cwd)
+
     void (async () => {
       await r.init()
       if (disposed) return
-      if (activeTheme) {
-        const theme = getBuiltinTheme(activeTheme)
-        if (theme) {
-          // When transparent, the pane background shows through, so blend the
-          // default themes' internal colors with the pane color; when opaque,
-          // show the genuine theme background.
-          r.applyTheme(transparentBackground ? patchPaneBg(theme) : theme, activeTheme)
+      try {
+        if (activeTheme) {
+          const theme = getBuiltinTheme(activeTheme)
+          if (theme) {
+            // When transparent, the pane background shows through, so blend the
+            // default themes' internal colors with the pane color; when opaque,
+            // show the genuine theme background.
+            r.applyTheme(transparentBackground ? patchPaneBg(theme) : theme, activeTheme)
+          }
         }
-      }
+      } catch { /* theme is cosmetic — never block first paint or the PTY flush */ }
       await new Promise(resolve => requestAnimationFrame(() => resolve(undefined)))
+      if (disposed) return
       r.updateSize(true)
 
-      const cwd = meta?.cwd
-      r.connectPty('', cwd)
-
-      // Register with addon (non-blocking)
-      addonApi.runPaneMutation('terminal', 'spawn', JSON.stringify({
-        id: paneId,
-        cwd: cwd || undefined,
-      })).catch(() => { })
+      // The WASM core can consume output now: replay the shell's startup
+      // output through the core's own onData callback (so its query/clipboard
+      // filter still runs), then let live data through.
+      const pending = gate.chunks.join('')
+      gate.chunks = []
+      gate.bytes = 0
+      gate.ready = true
+      if (pending) gate.sink?.(pending)
 
       // Only claim DOM focus when this pane is still the focused pane — async
       // init can complete long after the user moved focus elsewhere (or the
@@ -424,12 +497,23 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
       r.destroy()
       ptyTransportRef.current?.destroy?.()
       ptyTransportRef.current = null
+      ptyGateRef.current.ready = false
+      ptyGateRef.current.chunks = []
+      ptyGateRef.current.bytes = 0
+      ptyGateRef.current.sink = null
       terminalRef.current = null
       onPtyErrorRef.current(null)
     }
   }, [paneId, sessionId, getAdaptivePtyTransport])
 
+  // The Terminal is constructed with the current `renderer` already applied.
+  // This effect only has to react to changes: running it on mount would call
+  // setRenderer → init() a second time while the main effect's init() is still
+  // in flight (double WASM handle, double GPU backend, double render loop).
+  const appliedRendererRef = useRef(renderer)
   useEffect(() => {
+    if (appliedRendererRef.current === renderer) return
+    appliedRendererRef.current = renderer
     terminalRef.current?.setRenderer(renderer)
   }, [renderer])
 
@@ -437,9 +521,16 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
     terminalRef.current?.setFontSize(fontSize)
   }, [fontSize])
 
+  // Same story as the renderer: the terminal is constructed with these font
+  // sources, and setFontSources releases and re-acquires the whole (16 MB)
+  // font set. Skip the mount run so opening a pane doesn't load it twice.
+  const appliedFontsRef = useRef({ fontFamily, selectedLocalFont })
   useEffect(() => {
     const r = terminalRef.current
     if (!r) return
+    const applied = appliedFontsRef.current
+    if (applied.fontFamily === fontFamily && applied.selectedLocalFont === selectedLocalFont) return
+    appliedFontsRef.current = { fontFamily, selectedLocalFont }
     void (async () => {
       try {
         await r.setFontSources(buildFontSourcesForSelection(fontFamily, selectedLocalFont))

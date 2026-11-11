@@ -39,8 +39,8 @@ importers:
         specifier: ^0.1.0
         version: 0.1.0(react@19.3.1)
       '@zem-sh/terminal':
-        specifier: ^0.1.2
-        version: 0.1.2(typescript@5.9.3)
+        specifier: ^0.1.3
+        version: 0.1.3(typescript@5.9.3)
       d3-array:
         specifier: ^3.2.4
         version: 3.2.4
@@ -978,8 +978,8 @@ packages:
     peerDependencies:
       react: ^19.1.0
 
-  '@zem-sh/terminal@0.1.2':
-    resolution: {integrity: sha512-/jBFostitr5nP/3Z+xziXyPRq3ltN7Ah1XNhq1xIKpyzwtaFai3R13KESfwhkuNi1wzMpRfP7UfHj4eG3r20gA==}
+  '@zem-sh/terminal@0.1.3':
+    resolution: {integrity: sha512-IBrL9p4zz9mU5qgZvGZL/d8ioNYWRJkzlTCBtwOFJTkSIcJINC4vECL4SvOIrev4A5BHe7HYrbVdXLOzE1BWLA==}
     engines: {node: '>=18'}
 
   baseline-browser-mapping@2.11.28:
@@ -2404,7 +2404,7 @@ snapshots:
       '@zem-sh/keybinding': 0.1.0(react@19.3.1)
       react: 19.3.1
 
-  '@zem-sh/terminal@0.1.2(typescript@5.9.3)':
+  '@zem-sh/terminal@0.1.3(typescript@5.9.3)':
     dependencies:
       '@webgpu/types': 0.1.74
       text-shaper: 0.1.22(typescript@5.9.3)
