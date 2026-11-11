@@ -1,6 +1,6 @@
 id          = "sh.zem.base"
 name        = "base"
-version     = "1.0.0"
+version     = "1.0.1"
 description = "Zem base pane bundle: terminal, explorer, empty, stats, version control and notes"
 author      = "zem"
 

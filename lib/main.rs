@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addon = Addon::new()
         .id(ADDON_ID)
         .name("base")
-        .version("1.0.0")
+        .version("1.0.1")
         .description("Zem base panes: terminal, explorer, stats, version control, notes and status items")
         .min_zem_version("0.1.0")
         .require_zem_capability("notification.unfocused")

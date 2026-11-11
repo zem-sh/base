@@ -1,6 +1,6 @@
 [package]
 name = "base-addon"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Zem base addon: terminal, explorer, stats, version control, notes and general status items"
 license = "MIT"
