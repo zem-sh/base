@@ -600,9 +600,13 @@ function TerminalPaneInner({ paneId, isFocused, sessionId = 'default' }: PaneCom
       if (!isFocused) return
       // Don't open search bar when vim mode is active (vim mode handles / key)
       if (vimActive) return
-      // Ctrl+C is forwarded to the PTY by the terminal core; only add the
-      // scroll. Do not prevent or stop the event.
+      // Keep Ctrl+C as the conventional terminal interrupt byte even when the
+      // terminal core has Kitty keyboard reporting enabled. Older TTY apps
+      // can echo the Kitty CSI-u sequence as ordinary input.
       if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key?.toLowerCase() === 'c') {
+        e.preventDefault()
+        e.stopImmediatePropagation()
+        terminalRef.current?.sendKeyInput('\x03')
         scrollToBottom()
         return
       }
